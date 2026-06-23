@@ -1,0 +1,16 @@
+# Mouse Recorder Configuration
+
+# Database file path
+db_path = "D:\\elements\\mouse_recorder.db"
+
+# Directory for storing element screenshots
+image_dir = "D:\\elements"
+
+# Directory for automatic backups
+backup_dir = "D:\\backups"
+
+# Enable automatic backup on startup
+auto_backup = true
+
+# Maximum number of backups to keep (0 = unlimited)
+max_backups = 5
