@@ -95,7 +95,7 @@ fn set_window_exclude_from_capture(exclude: bool) {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use winapi::um::winuser::{FindWindowW, SetWindowDisplayAffinity, WDA_NONE};
-    let title: Vec<u16> = OsStr::new("Mouse Recorder v0.5").encode_wide().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = OsStr::new("Mouse Recorder").encode_wide().chain(std::iter::once(0)).collect();
     unsafe {
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
         if !hwnd.is_null() {
@@ -440,6 +440,7 @@ impl eframe::App for RecorderApp {
                         CaptureMsg::Up(x, y) => {
                             let saved_start = self.drag_start.take();
                             self.end_capture(ctx);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
 
                             if let Some((sx, sy)) = saved_start {
                                 let scale = self.scale;
@@ -452,6 +453,7 @@ impl eframe::App for RecorderApp {
                                 let (stx, srx) = mpsc::channel();
                                 thread::spawn(move || {
                                     let cfg = Config { db_path: Some(cfg), image_dir: Some(cfg_img) };
+                                    thread::sleep(Duration::from_millis(200));
                                     let deadline = std::time::Instant::now() + Duration::from_millis(500);
                                     loop {
                                         thread::sleep(Duration::from_millis(50));
@@ -550,6 +552,7 @@ impl eframe::App for RecorderApp {
                 if let Ok(result) = rx.try_recv() {
                     set_window_exclude_from_capture(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     match result {
                         Ok(img) => {
                             if self.is_add_state_mode {
@@ -593,6 +596,7 @@ impl eframe::App for RecorderApp {
                 } else if timed_out {
                     set_window_exclude_from_capture(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     self.mode = AppMode::Normal;
                     self.status = "Screenshot timed out".into();
                 }
