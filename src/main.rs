@@ -397,11 +397,9 @@ impl RecorderApp {
         self.drag_start = None;
         self.drag_current = None;
         self.mouse_pos = None;
+        set_window_exclude_from_capture(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-    }
-
-    fn restore_window(&self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(600.0, 450.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
     }
@@ -423,7 +421,6 @@ impl eframe::App for RecorderApp {
                 if let Some(started) = self.capture_started_at {
                     if started.elapsed().as_secs() >= 30 {
                         self.end_capture(ctx);
-                        self.restore_window(ctx);
                         self.mode = AppMode::Normal;
                         self.status = "Capture timed out (30s)".into();
                     }
@@ -473,7 +470,6 @@ impl eframe::App for RecorderApp {
                                 self.mode = AppMode::PendingScreenshot(px1, py1, px2, py2, srx, std::time::Instant::now());
                                 self.status = "Taking screenshot...".into();
                             } else {
-                                self.restore_window(ctx);
                                 self.mode = AppMode::Normal;
                                 self.status = "Cancelled".into();
                             }
@@ -549,7 +545,6 @@ impl eframe::App for RecorderApp {
 
                         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             self.end_capture(ctx);
-                            self.restore_window(ctx);
                             self.mode = AppMode::Normal;
                             self.status = "Cancelled".into();
                         }
@@ -558,56 +553,62 @@ impl eframe::App for RecorderApp {
             AppMode::PendingScreenshot(x1, y1, x2, y2, rx, started) => {
                 let x1 = *x1; let y1 = *y1; let x2 = *x2; let y2 = *y2;
                 let timed_out = started.elapsed().as_secs() >= 3;
-                if let Ok(result) = rx.try_recv() {
-                    log_error("screenshot received");
-                    set_window_exclude_from_capture(false);
-                    self.restore_window(ctx);
-                    match result {
-                        Ok(img) => {
-                            log_error(&format!("screenshot success: {}", img));
-                            if self.is_add_state_mode {
-                                if let (Some(elem_name), Some(last_state)) =
-                                    (self.last_element_name.clone(), self.last_state_name.clone())
-                                {
-                                    let next_state = if let Some(forced) = self.forced_state_name.take() {
-                                        forced
-                                    } else {
-                                        get_next_state_suffix(&last_state)
-                                    };
-                                    let new_path = std::path::Path::new(&self.image_dir).join(format!("{}_{}.png", elem_name, next_state)).to_string_lossy().to_string();
-                                    let img_path = if std::fs::rename(&img, &new_path).is_ok() { new_path } else { img };
-                                    if let Some(id) = self.last_id {
-                                        let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
-                                        match self.conn.execute(
-                                            "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,0,?4)",
-                                            params![id, next_state, img_path, ts]
-                                        ) {
-                                            Ok(_) => {
-                                                self.last_state_name = Some(next_state.clone());
-                                                self.status = format!("State '{}' added!", next_state);
-                                                self.refresh();
+                match rx.try_recv() {
+                    Ok(result) => {
+                        log_error("screenshot received");
+                        match result {
+                            Ok(img) => {
+                                log_error(&format!("screenshot success: {}", img));
+                                if self.is_add_state_mode {
+                                    if let (Some(elem_name), Some(last_state)) =
+                                        (self.last_element_name.clone(), self.last_state_name.clone())
+                                    {
+                                        let next_state = if let Some(forced) = self.forced_state_name.take() {
+                                            forced
+                                        } else {
+                                            get_next_state_suffix(&last_state)
+                                        };
+                                        let new_path = std::path::Path::new(&self.image_dir).join(format!("{}_{}.png", elem_name, next_state)).to_string_lossy().to_string();
+                                        let img_path = if std::fs::rename(&img, &new_path).is_ok() { new_path } else { img };
+                                        if let Some(id) = self.last_id {
+                                            let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
+                                            match self.conn.execute(
+                                                "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,0,?4)",
+                                                params![id, next_state, img_path, ts]
+                                            ) {
+                                                Ok(_) => {
+                                                    self.last_state_name = Some(next_state.clone());
+                                                    self.status = format!("State '{}' added!", next_state);
+                                                    self.refresh();
+                                                }
+                                                Err(e) => self.status = format!("Error: {}", e),
                                             }
-                                            Err(e) => self.status = format!("Error: {}", e),
                                         }
+                                        self.mode = AppMode::Normal;
                                     }
-                                    self.mode = AppMode::Normal;
+                                } else {
+                                    self.mode = AppMode::InputName(x1, y1, x2, y2, img);
+                                    self.input.clear();
+                                    self.status = "Enter element name:".into();
                                 }
-                            } else {
-                                self.mode = AppMode::InputName(x1, y1, x2, y2, img);
-                                self.input.clear();
-                                self.status = "Enter element name:".into();
+                            }
+                            Err(e) => {
+                                self.mode = AppMode::Normal;
+                                self.status = format!("Screenshot failed: {}", e);
                             }
                         }
-                        Err(e) => {
-                            self.mode = AppMode::Normal;
-                            self.status = format!("Screenshot failed: {}", e);
-                        }
                     }
-                } else if timed_out {
-                    set_window_exclude_from_capture(false);
-                    self.restore_window(ctx);
-                    self.mode = AppMode::Normal;
-                    self.status = "Screenshot timed out".into();
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        log_error("screenshot thread disconnected");
+                        self.mode = AppMode::Normal;
+                        self.status = "Screenshot crashed".into();
+                    }
+                    _ if timed_out => {
+                        log_error("screenshot timed out");
+                        self.mode = AppMode::Normal;
+                        self.status = "Screenshot timed out".into();
+                    }
+                    _ => {}
                 }
             }
             _ => {
@@ -685,7 +686,6 @@ impl eframe::App for RecorderApp {
                             ui.colored_label(Color32::RED, "Click and drag on screen to select region");
                             if ui.button("Cancel").clicked() {
                                 self.end_capture(ctx);
-                                self.restore_window(ctx);
                                 self.mode = AppMode::Normal;
                                 self.status = "Cancelled".into();
                             }
