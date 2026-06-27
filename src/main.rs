@@ -4,14 +4,91 @@ use chrono::Local;
 use eframe::egui::{self, Color32, ScrollArea, Stroke, Rect, Pos2, FontId};
 use rdev::{grab, Event, EventType, Button};
 use rusqlite::{params, Connection};
+use serde::Deserialize;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use xcap::Monitor;
+
+fn exe_dir() -> &'static std::path::Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = std::env::current_exe().expect("Failed to get exe path");
+        exe.parent().expect("Failed to get exe dir").to_path_buf()
+    })
+}
+
+fn data_dir() -> &'static std::path::Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| exe_dir().join("data"))
+}
+
+#[derive(Deserialize)]
+struct Config {
+    db_path: Option<String>,
+    image_dir: Option<String>,
+}
+
+impl Config {
+    fn load() -> Self {
+        let config_path = exe_dir().join("config.toml");
+        fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|content| toml::from_str(&content).ok())
+            .unwrap_or_default()
+    }
+
+    fn resolve(&self, path: &str) -> PathBuf {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() { p.to_path_buf() } else { exe_dir().join(p) }
+    }
+
+    fn db_path(&self) -> String {
+        self.db_path.as_ref()
+            .map(|p| self.resolve(p).to_string_lossy().to_string())
+            .unwrap_or_else(|| data_dir().join("mouse_recorder.db").to_string_lossy().to_string())
+    }
+
+    fn image_dir(&self) -> String {
+        self.image_dir.as_ref()
+            .map(|p| self.resolve(p).to_string_lossy().to_string())
+            .unwrap_or_else(|| data_dir().to_string_lossy().to_string())
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { db_path: None, image_dir: None }
+    }
+}
+
+fn log_error(msg: &str) {
+    let log_path = data_dir().join("error.log");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(f, "[{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+    }
+}
+
+fn setup_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = match info.payload().downcast_ref::<&str>() {
+            Some(s) => s.to_string(),
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => s.clone(),
+                None => format!("{:?}", info),
+            },
+        };
+        let loc = info.location().map(|l| l.to_string()).unwrap_or_default();
+        let full = if loc.is_empty() { msg } else { format!("{} at {}", msg, loc) };
+        log_error(&full);
+    }));
+}
 
 #[cfg(windows)]
 fn set_window_exclude_from_capture(exclude: bool) {
@@ -33,13 +110,11 @@ fn set_window_exclude_from_capture(_exclude: bool) {}
 
 fn get_next_state_suffix(current: &str) -> String {
     let suffixes = ["-n", "-s", "-h", "-d", "-f", "-a", "-p"];
-    
     for i in 0..suffixes.len() - 1 {
         if current == suffixes[i] {
             return suffixes[i + 1].to_string();
         }
     }
-    
     "-n".to_string()
 }
 
@@ -51,6 +126,9 @@ fn get_resolution() -> (u32, u32) {
 }
 
 fn init_db(path: &str) -> Connection {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        fs::create_dir_all(parent).expect("Failed to create DB directory");
+    }
     let conn = Connection::open(path).expect("Failed to open DB");
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS elements (
@@ -88,7 +166,7 @@ impl ScreenshotError {
     }
 }
 
-fn take_screenshot(x1: i32, y1: i32, x2: i32, y2: i32) -> Result<String, ScreenshotError> {
+fn take_screenshot(x1: i32, y1: i32, x2: i32, y2: i32, cfg: &Config) -> Result<String, ScreenshotError> {
     let px = x1.min(x2) as i32;
     let py = y1.min(y2) as i32;
     let pw = (x1 - x2).abs() as u32;
@@ -97,8 +175,9 @@ fn take_screenshot(x1: i32, y1: i32, x2: i32, y2: i32) -> Result<String, Screens
         return Err(ScreenshotError::Validation("Zero region".into()));
     }
     let ts = Local::now().format("%Y%m%d_%H%M%S_%3f");
-    let path = format!("D:\\elements\\capture_{}.png", ts);
-    fs::create_dir_all("D:\\elements").map_err(|e| ScreenshotError::Capture(e.to_string()))?;
+    let img_dir = cfg.image_dir();
+    fs::create_dir_all(&img_dir).map_err(|e| ScreenshotError::Capture(e.to_string()))?;
+    let path = std::path::Path::new(&img_dir).join(format!("capture_{}.png", ts));
 
     let monitors = Monitor::all().map_err(|e| ScreenshotError::Capture(e.to_string()))?;
     if monitors.is_empty() {
@@ -137,7 +216,7 @@ fn take_screenshot(x1: i32, y1: i32, x2: i32, y2: i32) -> Result<String, Screens
         }
     }
     cropped.save(&path).map_err(|e| ScreenshotError::Capture(e.to_string()))?;
-    Ok(path)
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[derive(Clone)]
@@ -167,9 +246,11 @@ fn load_elements(conn: &Connection) -> Vec<ElementRec> {
     res
 }
 
-fn export_csv(conn: &Connection, name: &str) -> Result<String, String> {
+fn export_csv(conn: &Connection, name: &str, cfg: &Config) -> Result<String, String> {
     let ts = Local::now().format("%Y%m%d_%H%M%S");
-    let path = format!("D:\\{}_{}.csv", name, ts);
+    let out_dir = cfg.image_dir();
+    let path = std::path::Path::new(&out_dir).join(format!("{}_{}.csv", name, ts));
+    let path_s = path.to_string_lossy().to_string();
     let mut f = fs::File::create(&path).map_err(|e| e.to_string())?;
     f.write_all(b"\xEF\xBB\xBF").map_err(|e| e.to_string())?;
     writeln!(f, "id,x,y,description,template_path,original_width,original_height").map_err(|e| e.to_string())?;
@@ -181,7 +262,7 @@ fn export_csv(conn: &Connection, name: &str) -> Result<String, String> {
         let (id, name, cx, cy, img, sw, sh) = row;
         writeln!(f, "{},{},{},\"{}\",\"{}\",{},{}", id, cx, cy, name.replace('"', "\"\""), img.replace('"', "\"\""), sw, sh).map_err(|e| e.to_string())?;
     }
-    Ok(path)
+    Ok(path_s)
 }
 
 fn create_elem(conn: &Connection, name: &str, state: &str, x1: i32, y1: i32, x2: i32, y2: i32, img: &str, sw: u32, sh: u32) -> Result<i32, String> {
@@ -259,13 +340,14 @@ fn start_listener(flag: Arc<AtomicBool>, tx: Sender<CaptureMsg>) {
             }
         };
         if let Err(e) = grab(cb) {
-            eprintln!("rdev error: {:?}", e);
+            log_error(&format!("rdev grab error: {:?}", e));
         }
     });
 }
 
 struct RecorderApp {
     conn: Connection,
+    config: Config,
     elements: Vec<ElementRec>,
     last_id: Option<i32>,
     last_element_name: Option<String>,
@@ -284,6 +366,7 @@ struct RecorderApp {
     capture_started_at: Option<std::time::Instant>,
     normal_window_size: Option<egui::Vec2>,
     forced_state_name: Option<String>,
+    image_dir: String,
 }
 
 impl RecorderApp {
@@ -300,7 +383,6 @@ impl RecorderApp {
         self.mode = AppMode::Capturing;
         self.is_add_state_mode = is_add_state;
         self.status = "Click and drag on screen to select region...".into();
-        
         self.normal_window_size = Some(ctx.screen_rect().size());
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(self.sw as f32 / self.scale, self.sh as f32 / self.scale)));
@@ -308,47 +390,17 @@ impl RecorderApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         set_window_exclude_from_capture(true);
     }
-    
+
     fn end_capture(&mut self, ctx: &egui::Context) {
         self.capture_flag.store(false, Ordering::Relaxed);
         self.capture_started_at = None;
         self.drag_start = None;
         self.drag_current = None;
         self.mouse_pos = None;
-
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(600.0, 450.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
-    }
-}
-
-impl Default for RecorderApp {
-    fn default() -> Self {
-        let (sw, sh) = get_resolution();
-        let conn = init_db("D:\\elements\\mouse_recorder.db");
-        let elems = load_elements(&conn);
-        let last = elems.last().map(|e| e.id);
-        let flag = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        start_listener(flag.clone(), tx);
-        Self {
-            conn, elements: elems, last_id: last, sw, sh,
-            scale: 1.0,
-            last_element_name: None,
-            last_state_name: None,
-            is_add_state_mode: false,
-            mode: AppMode::Normal,
-            input: String::new(),
-            status: "Ready. Click [New Element] to record".into(),
-            rx, capture_flag: flag,
-            drag_start: None,
-            drag_current: None,
-            mouse_pos: None,
-            capture_started_at: None,
-            normal_window_size: None,
-            forced_state_name: None,
-        }
     }
 }
 
@@ -388,19 +440,22 @@ impl eframe::App for RecorderApp {
                         CaptureMsg::Up(x, y) => {
                             let saved_start = self.drag_start.take();
                             self.end_capture(ctx);
-                            
+
                             if let Some((sx, sy)) = saved_start {
                                 let scale = self.scale;
                                 let px1 = (sx as f32 * scale) as i32;
                                 let py1 = (sy as f32 * scale) as i32;
                                 let px2 = (x as f32 * scale) as i32;
                                 let py2 = (y as f32 * scale) as i32;
+                                let cfg = self.config.db_path();
+                                let cfg_img = self.image_dir.clone();
                                 let (stx, srx) = mpsc::channel();
                                 thread::spawn(move || {
+                                    let cfg = Config { db_path: Some(cfg), image_dir: Some(cfg_img) };
                                     let deadline = std::time::Instant::now() + Duration::from_millis(500);
                                     loop {
                                         thread::sleep(Duration::from_millis(50));
-                                        match take_screenshot(px1, py1, px2, py2) {
+                                        match take_screenshot(px1, py1, px2, py2, &cfg) {
                                             Ok(s) => { let _ = stx.send(Ok(s)); break; }
                                             Err(e) if !e.is_retriable() || std::time::Instant::now() >= deadline => {
                                                 let _ = stx.send(Err(e.into_string())); break;
@@ -415,7 +470,7 @@ impl eframe::App for RecorderApp {
                         }
                     }
                 }
-                
+
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
                     .show(ctx, |ui| {
@@ -455,7 +510,7 @@ impl eframe::App for RecorderApp {
 
                             let w = (x2 - x1) as i32;
                             let h = (y2 - y1) as i32;
-                            let dims = format!(" {}×{} ", w, h);
+                            let dims = format!(" {}x{} ", w, h);
                             let lx = if x2 + 4.0 + dims.len() as f32 * 8.5 < sw { x2 + 4.0 } else { x1 };
                             let ly = if y2 + 24.0 < sh { y2 + 4.0 } else { y1 - 24.0 };
                             let label_bg = Rect::from_min_size(Pos2::new(lx, ly), egui::vec2(dims.len() as f32 * 8.5, 20.0));
@@ -506,7 +561,7 @@ impl eframe::App for RecorderApp {
                                     } else {
                                         get_next_state_suffix(&last_state)
                                     };
-                                    let new_path = format!("D:\\elements\\{}_{}.png", elem_name, next_state);
+                                    let new_path = std::path::Path::new(&self.image_dir).join(format!("{}_{}.png", elem_name, next_state)).to_string_lossy().to_string();
                                     let img_path = if std::fs::rename(&img, &new_path).is_ok() { new_path } else { img };
                                     if let Some(id) = self.last_id {
                                         let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
@@ -546,7 +601,7 @@ impl eframe::App for RecorderApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::central_panel(&ctx.style()))
                     .show(ctx, |ui| {
-                    ui.heading("Mouse Recorder v0.5");
+                    ui.heading("Mouse Recorder");
                     ui.label(format!("Resolution: {}x{}", self.sw, self.sh));
                     ui.separator();
 
@@ -642,7 +697,7 @@ impl eframe::App for RecorderApp {
                                         }
                                         AppMode::InputState(x1,y1,x2,y2,img,name,default_state) => {
                                             let state_name = if val.is_empty() { default_state } else { val };
-                                            let new_path = format!("D:\\elements\\{}_{}.png", name, state_name);
+                                            let new_path = std::path::Path::new(&self.image_dir).join(format!("{}_{}.png", name, state_name)).to_string_lossy().to_string();
                                             let img_path = if std::fs::rename(&img, &new_path).is_ok() {
                                                 new_path
                                             } else {
@@ -661,7 +716,7 @@ impl eframe::App for RecorderApp {
                                             self.input.clear();
                                         }
                                         AppMode::InputExport if !val.is_empty() => {
-                                            match export_csv(&self.conn, &val) {
+                                            match export_csv(&self.conn, &val, &self.config) {
                                                 Ok(p) => self.status = format!("Exported: {}", p),
                                                 Err(e) => self.status = format!("Export error: {}", e),
                                             }
@@ -688,12 +743,45 @@ impl eframe::App for RecorderApp {
 }
 
 fn main() -> eframe::Result {
+    setup_panic_hook();
+    let cfg = Config::load();
+    let db_path = cfg.db_path();
+    let image_dir = cfg.image_dir();
+    let conn = init_db(&db_path);
+    let (sw, sh) = get_resolution();
+    let elems = load_elements(&conn);
+    let last = elems.last().map(|e| e.id);
+    let flag = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    start_listener(flag.clone(), tx);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 450.0])
-            .with_title("Mouse Recorder v0.5")
+            .with_title("Mouse Recorder")
             .with_transparent(true),
         ..Default::default()
     };
-    eframe::run_native("Mouse Recorder", opts, Box::new(|_cc| Ok(Box::new(RecorderApp::default()))))
+    eframe::run_native("Mouse Recorder", opts, Box::new(|_cc| Ok(Box::new(RecorderApp {
+        conn,
+        config: cfg,
+        image_dir,
+        elements: elems,
+        last_id: last,
+        last_element_name: None,
+        last_state_name: None,
+        is_add_state_mode: false,
+        sw, sh,
+        scale: 1.0,
+        mode: AppMode::Normal,
+        input: String::new(),
+        status: "Ready. Click [New Element] to record".into(),
+        rx,
+        capture_flag: flag,
+        drag_start: None,
+        drag_current: None,
+        mouse_pos: None,
+        capture_started_at: None,
+        normal_window_size: None,
+        forced_state_name: None,
+    }))))
 }
