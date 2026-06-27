@@ -399,6 +399,9 @@ impl RecorderApp {
         self.mouse_pos = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+    }
+
+    fn restore_window(&self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(600.0, 450.0)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
     }
@@ -420,6 +423,7 @@ impl eframe::App for RecorderApp {
                 if let Some(started) = self.capture_started_at {
                     if started.elapsed().as_secs() >= 30 {
                         self.end_capture(ctx);
+                        self.restore_window(ctx);
                         self.mode = AppMode::Normal;
                         self.status = "Capture timed out (30s)".into();
                     }
@@ -438,8 +442,10 @@ impl eframe::App for RecorderApp {
                             }
                         }
                         CaptureMsg::Up(x, y) => {
+                            log_error("capture up start");
                             let saved_start = self.drag_start.take();
                             self.end_capture(ctx);
+                            log_error("capture up after end_capture");
 
                             if let Some((sx, sy)) = saved_start {
                                 let scale = self.scale;
@@ -466,6 +472,10 @@ impl eframe::App for RecorderApp {
                                 });
                                 self.mode = AppMode::PendingScreenshot(px1, py1, px2, py2, srx, std::time::Instant::now());
                                 self.status = "Taking screenshot...".into();
+                            } else {
+                                self.restore_window(ctx);
+                                self.mode = AppMode::Normal;
+                                self.status = "Cancelled".into();
                             }
                         }
                     }
@@ -539,6 +549,7 @@ impl eframe::App for RecorderApp {
 
                         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             self.end_capture(ctx);
+                            self.restore_window(ctx);
                             self.mode = AppMode::Normal;
                             self.status = "Cancelled".into();
                         }
@@ -548,10 +559,12 @@ impl eframe::App for RecorderApp {
                 let x1 = *x1; let y1 = *y1; let x2 = *x2; let y2 = *y2;
                 let timed_out = started.elapsed().as_secs() >= 3;
                 if let Ok(result) = rx.try_recv() {
+                    log_error("screenshot received");
                     set_window_exclude_from_capture(false);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
+                    self.restore_window(ctx);
                     match result {
                         Ok(img) => {
+                            log_error(&format!("screenshot success: {}", img));
                             if self.is_add_state_mode {
                                 if let (Some(elem_name), Some(last_state)) =
                                     (self.last_element_name.clone(), self.last_state_name.clone())
@@ -592,7 +605,7 @@ impl eframe::App for RecorderApp {
                     }
                 } else if timed_out {
                     set_window_exclude_from_capture(false);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(100.0, 100.0)));
+                    self.restore_window(ctx);
                     self.mode = AppMode::Normal;
                     self.status = "Screenshot timed out".into();
                 }
@@ -672,6 +685,7 @@ impl eframe::App for RecorderApp {
                             ui.colored_label(Color32::RED, "Click and drag on screen to select region");
                             if ui.button("Cancel").clicked() {
                                 self.end_capture(ctx);
+                                self.restore_window(ctx);
                                 self.mode = AppMode::Normal;
                                 self.status = "Cancelled".into();
                             }
