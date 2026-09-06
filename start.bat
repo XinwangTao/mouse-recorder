@@ -1,10 +1,12 @@
 @echo off
 chcp 65001 >nul 2>&1
-title Mouse Recorder v0.3
+title Mouse Recorder v0.5
 color 0B
 setlocal enabledelayedexpansion
 
-set BASE_DIR=D:\mouse-recorder
+:: Always run from this script's directory (project root)
+set "BASE_DIR=%~dp0"
+cd /d "%BASE_DIR%"
 
 :: Check Python
 python --version >nul 2>&1
@@ -17,13 +19,14 @@ if %ERRORLEVEL% NEQ 0 (
 
 :: Check if compiled binary exists (debug or release)
 set EXE_PATH=
-if exist "%BASE_DIR%\target\release\mouse-recorder.exe" set EXE_PATH=%BASE_DIR%\target\release\mouse-recorder.exe
-if exist "%BASE_DIR%\target\debug\mouse-recorder.exe" set EXE_PATH=%BASE_DIR%\target\debug\mouse-recorder.exe
+if exist "%BASE_DIR%target\release\mouse-recorder.exe" set "EXE_PATH=%BASE_DIR%target\release\mouse-recorder.exe"
+if exist "%BASE_DIR%target\debug\mouse-recorder.exe" set "EXE_PATH=%BASE_DIR%target\debug\mouse-recorder.exe"
+if exist "%BASE_DIR%dist\latest\mouse-recorder.exe" if not defined EXE_PATH set "EXE_PATH=%BASE_DIR%dist\latest\mouse-recorder.exe"
 
 :menu
 cls
 echo =============================================
-echo  Mouse Recorder - Multi-State System v0.3
+echo  Mouse Recorder - Multi-State System v0.5
 echo =============================================
 echo  1. Record elements (start recorder)
 echo  2. Export to mouse-clicker CSV
@@ -71,7 +74,7 @@ if not defined EXE_PATH (
             pause
             goto menu
         )
-        set "EXE_PATH=%BASE_DIR%\target\release\mouse-recorder.exe"
+        set "EXE_PATH=%BASE_DIR%target\release\mouse-recorder.exe"
         echo Build successful!
     ) else (
         pause
@@ -82,20 +85,11 @@ if not defined EXE_PATH (
 echo Starting recorder...
 echo.
 echo Controls:
-echo  [N] New element (select region - enter name - enter state)
-echo  [A] Add state to current element
-echo  [C] Cancel selection
-echo  [L] List all elements
-echo  [E] Export to CSV
+echo  [F5] New element
+echo  [F6] Add state
+echo  [F11] Verify match
+echo  [F12] Re-record
 echo  [Esc] Exit
-echo.
-echo Quick workflow:
-echo  1. Press N, move mouse to top-left, press N
-echo  2. Move mouse to bottom-right, press N
-echo  3. Enter element name (e.g. login_button)
-echo  4. Enter state name (e.g. normal)
-echo  5. Press A to add more states (hover, pressed...)
-echo  6. Press E to export for mouse-clicker
 echo.
 pause
 
@@ -114,7 +108,7 @@ set /p export_file="Enter export filename (without extension): "
 if "%export_file%"=="" set export_file=export
 
 cd /d "%BASE_DIR%"
-python safe_export.py "%export_file%.csv"
+python scripts\safe_export.py "%export_file%.csv"
 echo.
 pause
 goto menu
@@ -124,7 +118,7 @@ cls
 echo Verifying database integrity...
 echo.
 cd /d "%BASE_DIR%"
-python db_manager.py verify
+python scripts\db_manager.py verify
 echo.
 pause
 goto menu
@@ -134,7 +128,7 @@ cls
 echo Listing all elements...
 echo.
 cd /d "%BASE_DIR%"
-python db_manager.py list
+python scripts\db_manager.py list
 echo.
 pause
 goto menu
@@ -144,7 +138,7 @@ cls
 echo Database statistics...
 echo.
 cd /d "%BASE_DIR%"
-python db_manager.py stats
+python scripts\db_manager.py stats
 echo.
 pause
 goto menu
@@ -154,7 +148,7 @@ cls
 echo Creating database backup...
 echo.
 cd /d "%BASE_DIR%"
-python db_manager.py backup
+python scripts\db_manager.py backup
 echo.
 pause
 goto menu
@@ -183,7 +177,7 @@ if "%build_choice%"=="1" (
     call cargo build
     if %ERRORLEVEL%==0 (
         echo Build successful!
-        set EXE_PATH=%BASE_DIR%\target\debug\mouse-recorder.exe
+        set "EXE_PATH=%BASE_DIR%target\debug\mouse-recorder.exe"
     ) else (
         echo Build failed.
     )
@@ -193,7 +187,8 @@ if "%build_choice%"=="2" (
     call cargo build --release
     if %ERRORLEVEL%==0 (
         echo Build successful!
-        set EXE_PATH=%BASE_DIR%\target\release\mouse-recorder.exe
+        set "EXE_PATH=%BASE_DIR%target\release\mouse-recorder.exe"
+        copy /Y "%EXE_PATH%" "%BASE_DIR%dist\latest\mouse-recorder.exe" >nul
     ) else (
         echo Build failed.
     )
@@ -209,23 +204,22 @@ echo  Help - Mouse Recorder System
 echo ============================================
 echo.
 echo Files:
-echo  config.toml          Configuration file
-echo  manage.py            Python management tool
-echo  db_manager.py        Database manager
-echo  safe_export.py       Safe export tool
-echo  start.bat            This launcher
-echo  record.bat           Quick record launcher
+echo  config.toml             Configuration file
+echo  scripts\manage.py       Python management tool
+echo  scripts\db_manager.py   Database manager
+echo  scripts\safe_export.py  Safe export tool
+echo  start.bat               This launcher
+echo  record.bat              Quick record launcher
 echo.
 echo Documents:
-echo  README.md            Project overview
-echo  QUICKSTART_V3.md     Quick start guide
-echo  RUST_FIXES_REQUIRED.md  Rust fix guide
+echo  README.md               Project overview
+echo  docs\QUICKSTART_V3.md   Quick start guide
+echo  docs\MULTI_STATE_GUIDE.md  System guide
 echo.
 echo Workflow:
 echo  1. [1] Record - capture elements with multiple states
 echo  2. [2] Export - generate CSV for mouse-clicker
-echo  3. Open D:\mouse-clicker\mouse-clicker.exe
-echo  4. Load CSV - auto execute clicks
+echo  3. Load CSV in mouse-clicker and run
 echo.
 pause
 goto menu
@@ -233,7 +227,7 @@ goto menu
 :end
 cls
 echo.
-echo Thanks for using Mouse Recorder System v0.3
+echo Thanks for using Mouse Recorder System v0.5
 echo.
 timeout /t 2 >nul
 exit /b 0

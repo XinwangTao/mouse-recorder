@@ -13,8 +13,8 @@ from airtest.core.api import *
 
 # ==================== 配置区域 ====================
 
-# mouse-recorder 生成的 JSON 文件路径
-RECORDS_FILE = "D:/airtest_records_20260621_120000.json"
+# mouse-recorder 生成的 JSON 文件路径（改成你的导出文件）
+RECORDS_FILE = "data/export_elements.json"
 
 # 是否启用分辨率自动缩放
 AUTO_SCALE = True

@@ -11,7 +11,7 @@ Records screen regions by drag-select, storing each region as a named **element*
 - Screen resolution at capture time (for scaling on other resolutions)
 - One or more named **state** screenshots per element (normal, hover, selected, disabled, etc.)
 
-All data is stored in a SQLite database at `D:\elements\mouse_recorder.db`. Screenshots are saved to `D:\elements\`.
+All data is stored under `./data/` (see `config.toml`): SQLite at `data/mouse_recorder.db`, screenshots beside it.
 
 ---
 
@@ -25,7 +25,7 @@ target\release\mouse-recorder.exe
 Or use the management wrapper:
 
 ```
-python manage.py record
+python scripts/manage.py record
 ```
 
 ---
@@ -42,7 +42,26 @@ python manage.py record
 6. Enter a **state name** (default: `-n`)
 7. The element is saved with its screenshot, center coordinates, bounding box, and screen resolution
 
-> **Important:** Elements recorded this way get real coordinates. Images dropped manually into `D:\elements\` without going through this flow will have `center_x = 0, center_y = 0` in the database.
+### Browse & search
+
+- **Name search**: type in the search box above the list (case-insensitive substring). Shows `matched/total`. Press **Enter** in the search box to jump to the first match; **清除** clears the filter.
+- **Group filter**: names with `scene/foo` style go under group `scene`; others under `(未分组)`.
+- **Image preview**: selecting an element/state shows a live thumbnail on the right (also in Details / F10).
+- **Health badges**: list items tinted with `[缺图|中心0|ROI小|重名|分辨率|…]`; hover for details.
+- **Up / Down**: navigate within the *filtered* list (disabled while the search box is focused).
+
+### Verify / maintain
+
+| Action | Key | What it does |
+|--------|-----|----------------|
+| 验配 | F11 | Screenshot + template search in ROI (fallback full screen); overlay shows score, hit box (cyan), recorded center (yellow) |
+| 重录 | F12 | Re-capture current element+state, overwrite image/geometry, keep id/name |
+| 改名 | — | Rename element + image files; blocks collisions |
+| 状态对比 | — | Side-by-side state thumbnails |
+| 缩放到当前屏 | — | Banner when recorded resolution ≠ current; scales center/ROI |
+| 打开目录 | — | Open image/DB folder in Explorer |
+
+> **Important:** Elements recorded this way get real coordinates. Images dropped manually into `data/` without going through this flow will have `center_x = 0, center_y = 0` in the database.
 
 ### Add a state to existing element — F6
 
@@ -99,7 +118,7 @@ The `screen_width` / `screen_height` stored per element lets consumers rescale c
 
 ## Export to CSV
 
-Click **Export CSV**, enter a filename. Saved to `D:\<filename>_<timestamp>.csv`.
+Click **Export CSV**, enter a filename. Saved under `data/<filename>_<timestamp>.csv`.
 
 | Column | Description |
 |--------|-------------|
@@ -115,7 +134,7 @@ Click **Export CSV**, enter a filename. Saved to `D:\<filename>_<timestamp>.csv`
 
 ## Management Tools
 
-### `python manage.py <command>`
+### `python scripts/manage.py <command>`
 
 | Command | Description |
 |---------|-------------|
@@ -127,20 +146,20 @@ Click **Export CSV**, enter a filename. Saved to `D:\<filename>_<timestamp>.csv`
 | `export <file.csv>` | Safe export with validation |
 | `backup` | Create timestamped DB backup |
 
-### `python db_manager.py <command>`
+### `python scripts/db_manager.py <command>`
 
 Lower-level DB operations:
 
 ```
-python db_manager.py list [name_filter]
-python db_manager.py set-primary <element_id> <state_name>
-python db_manager.py delete-state <element_id> <state_name>
-python db_manager.py delete-element <element_id>
-python db_manager.py export-clicker [output.csv]
-python db_manager.py export-json [output.json] [--all-states]
-python db_manager.py export-matrix [output.json]
-python db_manager.py verify
-python db_manager.py backup
+python scripts/db_manager.py list [name_filter]
+python scripts/db_manager.py set-primary <element_id> <state_name>
+python scripts/db_manager.py delete-state <element_id> <state_name>
+python scripts/db_manager.py delete-element <element_id>
+python scripts/db_manager.py export-clicker [output.csv]
+python scripts/db_manager.py export-json [output.json] [--all-states]
+python scripts/db_manager.py export-matrix [output.json]
+python scripts/db_manager.py verify
+python scripts/db_manager.py backup
 ```
 
 ---
@@ -180,10 +199,12 @@ Each element has exactly one primary state (`is_primary = 1`). This state is use
 
 | Path | Contents |
 |------|----------|
-| `D:\elements\mouse_recorder.db` | SQLite database |
-| `D:\elements\<name>_<state>.png` | Screenshot files |
-| `D:\<name>_<timestamp>.csv` | CSV exports |
-| `D:\backups\mouse_recorder_<ts>.db` | DB backups (keeps last 5) |
+| `data/mouse_recorder.db` | SQLite database |
+| `data/<name>_<state>.png` | Screenshot files |
+| `data/backups/` | DB backups |
+| `dist/latest/` | Current packaged release |
+| `docs/` | Guides and API reference |
+| `scripts/` | Python management tools |
 
 ---
 

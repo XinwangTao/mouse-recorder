@@ -1,19 +1,30 @@
 [package]
 name = "mouse-recorder"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
 device_query = "2"
 rdev = { version = "0.5", features = ["unstable_grab"] }
 chrono = "0.4"
-xcap = "0.9"
 image = "0.25"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
-eframe = "0.30"
+# glow: true window transparency on Windows (wgpu often paints black)
+eframe = { version = "0.30", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 toml = "0.8"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser"] }
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+# unwind: capture failures must not silently abort the process (windows subsystem)
+panic = "unwind"

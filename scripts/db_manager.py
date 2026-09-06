@@ -17,7 +17,21 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-DB_PATH = "D:/elements/mouse_recorder.db"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DB_PATH = str(ROOT_DIR / "data" / "mouse_recorder.db")
+IMAGE_DIR = ROOT_DIR / "data"
+
+
+def resolve_image_path(image_path: str) -> Path:
+    """Resolve DB image_path (basename or absolute legacy path) to a real file."""
+    p = Path(image_path)
+    if p.is_file():
+        return p
+    cand = IMAGE_DIR / p.name
+    if cand.is_file():
+        return cand
+    return p
+
 
 class ElementDatabase:
     def __init__(self, db_path: str = DB_PATH):
@@ -125,7 +139,8 @@ class ElementDatabase:
         if element_ids:
             placeholders = ','.join('?' * len(element_ids))
             query = f"""
-                SELECT e.id, e.name, e.center_x, e.center_y, es.image_path
+                SELECT e.id, e.name, e.center_x, e.center_y, es.image_path,
+                       e.screen_width, e.screen_height
                 FROM elements e
                 JOIN element_states es ON e.id = es.element_id AND es.is_primary = 1
                 WHERE e.id IN ({placeholders})
@@ -134,7 +149,8 @@ class ElementDatabase:
             cursor.execute(query, element_ids)
         else:
             query = """
-                SELECT e.id, e.name, e.center_x, e.center_y, es.image_path
+                SELECT e.id, e.name, e.center_x, e.center_y, es.image_path,
+                       e.screen_width, e.screen_height
                 FROM elements e
                 JOIN element_states es ON e.id = es.element_id AND es.is_primary = 1
                 ORDER BY e.id
@@ -143,11 +159,13 @@ class ElementDatabase:
         
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['id', 'x', 'y', 'description', 'template_path'])
+            writer.writerow(['id', 'x', 'y', 'description', 'template_path',
+                             'original_width', 'original_height'])
             
             for row in cursor.fetchall():
-                elem_id, name, center_x, center_y, image_path = row
-                writer.writerow([elem_id, center_x, center_y, name, image_path])
+                elem_id, name, center_x, center_y, image_path, sw, sh = row
+                full = str(resolve_image_path(image_path))
+                writer.writerow([elem_id, center_x, center_y, name, full, sw, sh])
         
         return output_path
     
@@ -237,7 +255,7 @@ class ElementDatabase:
         
         missing_images = []
         for state_id, elem_id, image_path in states:
-            if not Path(image_path).exists():
+            if not resolve_image_path(image_path).is_file():
                 missing_images.append((state_id, elem_id, image_path))
         
         if missing_images:
@@ -321,20 +339,20 @@ def main():
                     print(f"✓ Deleted element #{element_id}")
             
             elif command == "export-clicker":
-                output = sys.argv[2] if len(sys.argv) > 2 else "D:/export_clicker.csv"
+                output = sys.argv[2] if len(sys.argv) > 2 else str(ROOT_DIR / "data" / "export_clicker.csv")
                 db.export_to_clicker(output)
-                print(f"✓ Exported to: {output}")
+                print(f"[OK] Exported to: {output}")
             
             elif command == "export-json":
-                output = sys.argv[2] if len(sys.argv) > 2 else "D:/export_elements.json"
+                output = sys.argv[2] if len(sys.argv) > 2 else str(ROOT_DIR / "data" / "export_elements.json")
                 all_states = "--all-states" in sys.argv
                 db.export_to_json(output, all_states)
-                print(f"✓ Exported to: {output}")
+                print(f"[OK] Exported to: {output}")
             
             elif command == "export-matrix":
-                output = sys.argv[2] if len(sys.argv) > 2 else "D:/state_matrix.json"
+                output = sys.argv[2] if len(sys.argv) > 2 else str(ROOT_DIR / "data" / "state_matrix.json")
                 db.export_state_matrix(output)
-                print(f"✓ Exported state matrix to: {output}")
+                print(f"[OK] Exported state matrix to: {output}")
             
             elif command == "verify":
                 result = db.verify_integrity()
@@ -357,7 +375,7 @@ def main():
                 import shutil
                 from datetime import datetime
                 
-                backup_dir = "D:/backups"
+                backup_dir = str(ROOT_DIR / "data" / "backups")
                 os.makedirs(backup_dir, exist_ok=True)
                 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -1,1 +1,32 @@
-/target
+# Rust build
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime user data (keep folder via .gitkeep)
+/data/**
+!/data/.gitkeep
+!/data/backups/
+/data/backups/**
+!/data/backups/.gitignore
+
+# Release binaries / packages
+/dist/
+*.exe
+*.zip
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Codegraph local index
+.codegraph/

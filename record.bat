@@ -3,12 +3,14 @@ chcp 65001 >nul 2>&1
 title Mouse Recorder - Record Mode
 color 0A
 
-set BASE_DIR=D:\mouse-recorder
+set "BASE_DIR=%~dp0"
+cd /d "%BASE_DIR%"
 
-:: Find binary
+:: Find binary (prefer release build, then dist/latest)
 set EXE_PATH=
-if exist "%BASE_DIR%\target\release\mouse-recorder.exe" set EXE_PATH=%BASE_DIR%\target\release\mouse-recorder.exe
-if exist "%BASE_DIR%\target\debug\mouse-recorder.exe" set EXE_PATH=%BASE_DIR%\target\debug\mouse-recorder.exe
+if exist "%BASE_DIR%target\release\mouse-recorder.exe" set "EXE_PATH=%BASE_DIR%target\release\mouse-recorder.exe"
+if not defined EXE_PATH if exist "%BASE_DIR%dist\latest\mouse-recorder.exe" set "EXE_PATH=%BASE_DIR%dist\latest\mouse-recorder.exe"
+if not defined EXE_PATH if exist "%BASE_DIR%target\debug\mouse-recorder.exe" set "EXE_PATH=%BASE_DIR%target\debug\mouse-recorder.exe"
 
 if not defined EXE_PATH (
     echo ==========================================
@@ -16,8 +18,10 @@ if not defined EXE_PATH (
     echo ==========================================
     echo.
     echo Binary not found. Build first:
-    echo   cd /d %BASE_DIR%
+    echo   cd /d "%BASE_DIR%"
     echo   cargo build --release
+    echo.
+    echo Or run: start.bat  then choose [7] Build
     echo.
     pause
     exit /b 1
@@ -28,18 +32,11 @@ echo  Mouse Recorder - Recording Mode
 echo ==========================================
 echo.
 echo Controls:
-echo  [N] New element (select region - name - state)
-echo  [A] Add state to current element
-echo  [C] Cancel selection
-echo  [L] List all elements
-echo  [E] Export to CSV
+echo  [F5] New element
+echo  [F6] Add state
+echo  [F11] Verify match
+echo  [F12] Re-record
 echo  [Esc] Exit
-echo.
-echo Workflow:
-echo  1. Press N, move mouse to element, press N
-echo  2. Enter element name and state name
-echo  3. Press A to add more states
-echo  4. Press E to export for mouse-clicker
 echo.
 pause
 

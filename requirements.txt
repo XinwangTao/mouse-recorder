@@ -1,0 +1,8 @@
+# Optional Python tooling (scripts/)
+# Core app is Rust — these are helpers only.
+
+# batch_recalc_roi.py
+Pillow>=10.0.0
+
+# airtest_automation.py (optional; heavy)
+# airtest>=1.3.0
