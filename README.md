@@ -42,7 +42,12 @@ mouse-recorder.exe --cli <command> [options]
 |---------|--------------|
 | `list [--filter X] [--json]` | List elements and states |
 | `get <name> [--state S] [--json]` | Show one element |
-| `record --name NAME --rect x,y,w,h [--state S] [--overwrite]` | Capture a region without the GUI |
+| `record --name NAME --rect x,y,w,h [--state S] [--overwrite]` | Capture a region without the GUI; a new state is added when the element exists |
+| `rename <old> <new>` | Rename an element (files + DB) |
+| `delete <name> [--state S]` | Delete an element or one state |
+| `set-primary <name> <state>` | Set the primary state |
+| `export --format csv\|json [--out PATH]` | Export elements |
+| `backup [--out DIR]` | Checkpoint and copy the SQLite DB |
 | `find --element NAME[:STATE]` / `--template PATH` | Template search on the current screen |
 | `verify ...` | Same match, exit 3 when the score is below threshold |
 | `click --element NAME[:STATE]` / `--template PATH` / `--uia` / `--coords x,y` | Click a target; `--verify` re-checks afterwards |

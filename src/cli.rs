@@ -4,6 +4,7 @@
 use crate::matchutil::{self, MatchHit};
 use crate::{Config, ElementRec};
 use image::RgbaImage;
+use rusqlite::params;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,11 @@ pub fn run(args: Vec<String>) -> i32 {
         "list" => cmd_list(rest),
         "get" => cmd_get(rest),
         "record" => cmd_record(rest),
+        "rename" => cmd_rename(rest),
+        "delete" => cmd_delete(rest),
+        "set-primary" => cmd_set_primary(rest),
+        "export" => cmd_export(rest),
+        "backup" => cmd_backup(rest),
         "find" => cmd_find(rest),
         "verify" => cmd_verify(rest),
         "click" => cmd_click(rest),
@@ -105,6 +111,11 @@ Commands:
   get <name> [--state S] [--json]        Show one element
   record --name NAME --rect x,y,w,h      Capture a region without the GUI
          [--state S] [--overwrite] [--json]
+  rename <old> <new>                     Rename an element (files + DB)
+  delete <name> [--state S]              Delete an element or one state
+  set-primary <name> <state>             Set the primary state
+  export --format csv|json [--out PATH]  Export elements
+  backup [--out DIR]                     Checkpoint + copy the SQLite DB
   find  (--element NAME[:STATE] | --template PATH)
          [--threshold F] [--roi x,y,w,h] [--json]
   verify (--element NAME[:STATE] | --template PATH)
@@ -560,25 +571,36 @@ fn cmd_record(args: &[String]) -> i32 {
         Err(e) => return fail(5, format!("begin tx: {e}")),
     };
     let existing = crate::find_element_id_by_name(&conn, &name);
-    let db_result: Result<i32, String> = if opts.flag("overwrite") {
-        match existing {
-            Some(id) => crate::overwrite_elem(
-                &tx, id, &state, ix, iy, ix + iw, iy + ih, &db_img, sw as u32, sh as u32,
-                ox, oy,
-            )
-            .map(|_| id),
-            None => crate::create_elem_in_tx(
-                &tx, &name, &state, ix, iy, ix + iw, iy + ih, &db_img, sw as u32, sh as u32,
-                ox, oy,
-            ),
+    let overwrite = opts.flag("overwrite");
+    let db_result: Result<i32, String> = match existing {
+        Some(id) => {
+            if crate::state_exists(&tx, id, &state) {
+                if overwrite {
+                    crate::overwrite_elem(
+                        &tx, id, &state, ix, iy, ix + iw, iy + ih, &db_img, sw as u32,
+                        sh as u32, ox, oy,
+                    )
+                    .map(|_| id)
+                } else {
+                    Err(format!(
+                        "状态已存在: {name} [{state}]（加 --overwrite 覆盖）"
+                    ))
+                }
+            } else {
+                // Add a new state to an existing element, keeping geometry.
+                let ts = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+                tx.execute(
+                    "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,0,?4)",
+                    params![id, state, db_img, ts],
+                )
+                .map_err(|e| e.to_string())
+                .map(|_| id)
+            }
         }
-    } else if existing.is_some() {
-        Err(format!("元件已存在: {name}（加 --overwrite 覆盖）"))
-    } else {
-        crate::create_elem_in_tx(
+        None => crate::create_elem_in_tx(
             &tx, &name, &state, ix, iy, ix + iw, iy + ih, &db_img, sw as u32, sh as u32,
             ox, oy,
-        )
+        ),
     };
     let id = match db_result {
         Ok(id) => id,
@@ -706,6 +728,172 @@ fn do_match(opts: &Opts, json: bool) -> i32 {
         0
     } else {
         3
+    }
+}
+
+fn cmd_rename(args: &[String]) -> i32 {
+    let opts = match Opts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return usage(&e),
+    };
+    let (Some(old), Some(new)) = (opts.positional.first(), opts.positional.get(1)) else {
+        return usage("rename 需要 <old> <new>");
+    };
+    let (cfg, conn) = open_db();
+    let Some(id) = crate::find_element_id_by_name(&conn, old) else {
+        return fail(3, format!("元件不存在: {old}"));
+    };
+    match crate::rename_element(&conn, &cfg.image_dir(), id, old, new) {
+        Ok(()) => {
+            if opts.flag("json") {
+                emit_json(&serde_json::json!({"ok": true, "id": id, "old": old, "new": new}));
+            } else {
+                println!("renamed #{id}: {old} -> {new}");
+            }
+            0
+        }
+        Err(e) => fail(5, e),
+    }
+}
+
+fn cmd_delete(args: &[String]) -> i32 {
+    let opts = match Opts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return usage(&e),
+    };
+    let Some(name) = opts.positional.first() else {
+        return usage("delete 需要 <name> [--state S]");
+    };
+    let (cfg, conn) = open_db();
+    let Some(id) = crate::find_element_id_by_name(&conn, name) else {
+        return fail(3, format!("元件不存在: {name}"));
+    };
+    let state = opts.value("state");
+    let result = match state.as_deref() {
+        Some(s) => crate::delete_state(&conn, &cfg.image_dir(), id, s),
+        None => crate::delete_element(&conn, &cfg.image_dir(), id),
+    };
+    match result {
+        Ok(()) => {
+            if opts.flag("json") {
+                emit_json(&serde_json::json!({
+                    "ok": true, "id": id, "name": name, "state": state
+                }));
+            } else {
+                println!(
+                    "deleted #{} {}{}",
+                    id,
+                    name,
+                    state.map(|s| format!(" [{s}]")).unwrap_or_default()
+                );
+            }
+            0
+        }
+        Err(e) => fail(5, e),
+    }
+}
+
+fn cmd_set_primary(args: &[String]) -> i32 {
+    let opts = match Opts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return usage(&e),
+    };
+    let Some(name) = opts.positional.first() else {
+        return usage("set-primary 需要 <name> <state>");
+    };
+    let state = opts
+        .positional
+        .get(1)
+        .cloned()
+        .or_else(|| opts.value("state"));
+    let Some(state) = state else {
+        return usage("set-primary 需要 <name> <state>");
+    };
+    let (_cfg, conn) = open_db();
+    let Some(id) = crate::find_element_id_by_name(&conn, name) else {
+        return fail(3, format!("元件不存在: {name}"));
+    };
+    match crate::set_primary_state(&conn, id, &state) {
+        Ok(()) => {
+            if opts.flag("json") {
+                emit_json(&serde_json::json!({
+                    "ok": true, "id": id, "name": name, "state": state
+                }));
+            } else {
+                println!("primary #{id} {name} -> {state}");
+            }
+            0
+        }
+        Err(e) => fail(5, e),
+    }
+}
+
+fn cmd_export(args: &[String]) -> i32 {
+    let opts = match Opts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return usage(&e),
+    };
+    let format = opts
+        .value("format")
+        .unwrap_or_else(|| "json".to_string())
+        .to_lowercase();
+    let out = opts.value("out");
+    let (cfg, conn) = open_db();
+    let elements = crate::load_elements(&conn);
+    match format.as_str() {
+        "csv" => {
+            let base = out.unwrap_or_else(|| "export".to_string());
+            match crate::export_csv(&conn, &base, &cfg) {
+                Ok(path) => {
+                    println!("{path}");
+                    0
+                }
+                Err(e) => fail(5, e),
+            }
+        }
+        "json" => {
+            let rows: Vec<ElementOut> = elements.iter().map(|e| element_out(&cfg, e)).collect();
+            let text = serde_json::to_string_pretty(&rows).unwrap_or_default();
+            match out {
+                Some(path) => match std::fs::write(&path, text) {
+                    Ok(()) => {
+                        println!("{path}");
+                        0
+                    }
+                    Err(e) => fail(5, format!("write {path}: {e}")),
+                },
+                None => {
+                    println!("{text}");
+                    0
+                }
+            }
+        }
+        other => usage(&format!("未知导出格式: {other}（csv|json）")),
+    }
+}
+
+fn cmd_backup(args: &[String]) -> i32 {
+    let opts = match Opts::parse(args) {
+        Ok(o) => o,
+        Err(e) => return usage(&e),
+    };
+    let (cfg, conn) = open_db();
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(FULL);");
+    let dir = opts
+        .value("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&cfg.image_dir()).join("backups"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return fail(5, format!("create {}: {e}", dir.display()));
+    }
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let dest = dir.join(format!("mouse_recorder_{ts}.db"));
+    match std::fs::copy(cfg.db_path(), &dest) {
+        Ok(_) => {
+            println!("{}", dest.display());
+            0
+        }
+        Err(e) => fail(5, format!("backup: {e}")),
     }
 }
 
