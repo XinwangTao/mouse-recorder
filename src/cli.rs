@@ -359,6 +359,42 @@ pub(crate) fn match_element(
     })
 }
 
+pub(crate) fn match_template_file(
+    screen: &Screen,
+    path: &str,
+    roi: Option<&str>,
+    threshold: f32,
+) -> Result<Option<MatchHit>, String> {
+    let template = image::open(path)
+        .map_err(|e| format!("load template {path}: {e}"))?
+        .to_rgba8();
+    let (sw, sh) = (screen.img.width() as i32, screen.img.height() as i32);
+    let roi_img = match roi {
+        Some(r) => {
+            let (x, y, w, h) = parse_rect(r)?;
+            let ix0 = x - screen.origin.0;
+            let iy0 = y - screen.origin.1;
+            let (bx, by, bw, bh) = crate::clamp_drag_to_image(
+                ix0,
+                iy0,
+                ix0 + w,
+                iy0 + h,
+                sw as u32,
+                sh as u32,
+            )
+            .ok_or_else(|| "ROI 不在当前虚拟桌面内".to_string())?;
+            Some((bx as i32, by as i32, bw as i32, bh as i32))
+        }
+        None => None,
+    };
+    Ok(matchutil::find_template_smart(
+        &screen.img,
+        &template,
+        roi_img,
+        threshold,
+    ))
+}
+
 pub(crate) fn parse_rect(s: &str) -> Result<(i32, i32, i32, i32), String> {
     let parts: Vec<i32> = s
         .split(',')
@@ -372,9 +408,11 @@ pub(crate) fn parse_rect(s: &str) -> Result<(i32, i32, i32, i32), String> {
 }
 
 pub(crate) fn timestamp_dir(cfg: &Config, report_dir: Option<&str>) -> PathBuf {
-    let base = report_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&cfg.image_dir()).join("..").join("runs"));
+    let base = report_dir.map(PathBuf::from).unwrap_or_else(|| {
+        let image_dir = cfg.image_dir();
+        let img = Path::new(&image_dir);
+        img.parent().unwrap_or(img).join("runs")
+    });
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     base.join(ts.to_string())
 }
@@ -888,12 +926,24 @@ fn cmd_backup(args: &[String]) -> i32 {
     }
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let dest = dir.join(format!("mouse_recorder_{ts}.db"));
-    match std::fs::copy(cfg.db_path(), &dest) {
-        Ok(_) => {
+    // VACUUM INTO produces a consistent snapshot even with WAL readers.
+    let escaped = dest.to_string_lossy().replace('\'', "''");
+    match conn.execute_batch(&format!("VACUUM INTO '{escaped}';")) {
+        Ok(()) => {
             println!("{}", dest.display());
             0
         }
-        Err(e) => fail(5, format!("backup: {e}")),
+        Err(vacuum_err) => {
+            eprintln!("warning: VACUUM INTO failed ({vacuum_err}); falling back to copy");
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(FULL);");
+            match std::fs::copy(cfg.db_path(), &dest) {
+                Ok(_) => {
+                    println!("{}", dest.display());
+                    0
+                }
+                Err(e) => fail(5, format!("backup: {e}")),
+            }
+        }
     }
 }
 
@@ -927,6 +977,9 @@ fn cmd_click(args: &[String]) -> i32 {
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(0.85);
     let verify = opts.flag("verify");
+    if verify && opts.value("element").is_none() && opts.value("template").is_none() {
+        return usage("--verify 需要 --element 或 --template");
+    }
 
     let (x, y, score) = if let Some(c) = opts.value("coords") {
         match parse_rect(&format!("{c},0,0")) {
@@ -935,12 +988,39 @@ fn cmd_click(args: &[String]) -> i32 {
         }
     } else if opts.flag("uia") {
         let win = opts.value("window").unwrap_or_default();
+        if win.trim().is_empty() {
+            return usage("--uia 需要 --window");
+        }
         let Some(sel) = uia::Selector::from_opts(&opts) else {
             return usage("--uia 需要 --name / --automation-id / --class / --control-type");
         };
         match uia::find(&win, &sel) {
             Ok(Some(n)) => (n.cx(), n.cy(), None),
             Ok(None) => return fail(3, "UIA 未找到目标控件"),
+            Err(e) => return fail(5, e),
+        }
+    } else if let Some(path) = opts.value("template") {
+        let screen = match capture() {
+            Ok(s) => s,
+            Err(e) => return fail(5, e),
+        };
+        match match_template_file(&screen, &path, opts.value("roi").as_deref(), threshold) {
+            Ok(Some(h)) if h.score >= threshold => {
+                let (cx, cy) = screen.to_screen(h.hit_cx, h.hit_cy);
+                (cx, cy, Some(h.score))
+            }
+            Ok(Some(h)) => {
+                if json {
+                    emit_json(&serde_json::json!({
+                        "ok": false, "reason": "low_score", "score": h.score,
+                        "threshold": threshold
+                    }));
+                } else {
+                    println!("not clicking: score {:.4} < {:.2}", h.score, threshold);
+                }
+                return 3;
+            }
+            Ok(None) => return fail(3, "template not found"),
             Err(e) => return fail(5, e),
         }
     } else {
@@ -1003,35 +1083,65 @@ fn cmd_click(args: &[String]) -> i32 {
             Ok(s) => s,
             Err(e) => return fail(5, e),
         };
-        let spec = opts.value("element").unwrap_or_default();
-        let (name, state) = match spec.split_once(':') {
-            Some((n, s)) => (n.to_string(), Some(s.to_string())),
-            None => (spec, opts.value("state")),
-        };
-        let elements = crate::load_elements(&conn);
-        if let Some(e) = find_element(&elements, &name).cloned() {
-            match match_element(&cfg, &screen, &e, state.as_deref(), threshold) {
-                Ok(r) => {
+        if let Some(path) = opts.value("template") {
+            match match_template_file(&screen, &path, opts.value("roi").as_deref(), threshold) {
+                Ok(hit) => {
+                    let (found, score, after) = match hit {
+                        Some(h) => {
+                            let (cx, cy) = screen.to_screen(h.hit_cx, h.hit_cy);
+                            (h.score >= threshold, h.score, (cx, cy))
+                        }
+                        None => (false, 0.0, (0, 0)),
+                    };
                     if json {
                         emit_json(&serde_json::json!({
-                            "ok": r.found, "clicked": [x, y], "score": r.hit.score,
-                            "threshold": threshold, "after_center": [r.screen_cx, r.screen_cy]
+                            "ok": found, "clicked": [x, y], "score": score,
+                            "threshold": threshold, "after_center": after
                         }));
                     } else {
                         println!(
                             "clicked ({}, {}) verify score={:.4} {}",
                             x,
                             y,
-                            r.hit.score,
-                            if r.found { "ok" } else { "FAILED" }
+                            score,
+                            if found { "ok" } else { "FAILED" }
                         );
                     }
-                    if r.found { 0 } else { 4 }
+                    if found { 0 } else { 4 }
                 }
                 Err(e) => fail(5, e),
             }
         } else {
-            3
+            let spec = opts.value("element").unwrap_or_default();
+            let (name, state) = match spec.split_once(':') {
+                Some((n, s)) => (n.to_string(), Some(s.to_string())),
+                None => (spec, opts.value("state")),
+            };
+            let elements = crate::load_elements(&conn);
+            if let Some(e) = find_element(&elements, &name).cloned() {
+                match match_element(&cfg, &screen, &e, state.as_deref(), threshold) {
+                    Ok(r) => {
+                        if json {
+                            emit_json(&serde_json::json!({
+                                "ok": r.found, "clicked": [x, y], "score": r.hit.score,
+                                "threshold": threshold, "after_center": [r.screen_cx, r.screen_cy]
+                            }));
+                        } else {
+                            println!(
+                                "clicked ({}, {}) verify score={:.4} {}",
+                                x,
+                                y,
+                                r.hit.score,
+                                if r.found { "ok" } else { "FAILED" }
+                            );
+                        }
+                        if r.found { 0 } else { 4 }
+                    }
+                    Err(e) => fail(5, e),
+                }
+            } else {
+                3
+            }
         }
     } else {
         if json {
@@ -1060,6 +1170,40 @@ fn cmd_ocr(args: &[String]) -> i32 {
     let mut origin = (0, 0);
     let image = if let Some(p) = opts.value("image") {
         PathBuf::from(p)
+    } else if let Some(win) = opts.value("window") {
+        let screen = match capture() {
+            Ok(s) => s,
+            Err(e) => return fail(5, e),
+        };
+        let (wx, wy, ww, wh) = match uia::window_rect(&win) {
+            Ok(v) => v,
+            Err(e) => return fail(5, e),
+        };
+        let (ox, oy) = screen.origin;
+        let ix0 = (wx - ox).max(0);
+        let iy0 = (wy - oy).max(0);
+        let ix1 = (wx + ww - ox).min(screen.img.width() as i32);
+        let iy1 = (wy + wh - oy).min(screen.img.height() as i32);
+        if ix1 <= ix0 || iy1 <= iy0 {
+            return fail(3, "窗口不在当前虚拟桌面内");
+        }
+        origin = (ox + ix0, oy + iy0);
+        let cropped = image::imageops::crop_imm(
+            &screen.img,
+            ix0 as u32,
+            iy0 as u32,
+            (ix1 - ix0) as u32,
+            (iy1 - iy0) as u32,
+        )
+        .to_image();
+        let (cfg, _) = open_db();
+        let dir = timestamp_dir(&cfg, None);
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("ocr_window.png");
+        if let Err(e) = cropped.save(&p) {
+            return fail(5, format!("save window crop: {e}"));
+        }
+        p
     } else {
         let screen = match capture() {
             Ok(s) => s,

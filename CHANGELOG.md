@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.2] — 2026-11-06
+
+### Fixed
+- `click --template` now actually resolves a template target (it was advertised
+  but unimplemented). `--verify` works with either `--element` or `--template`.
+- `click --verify` without `--element`/`--template` is a usage error instead of a
+  silent 3.
+- `--uia` requires `--window`; empty titles, minimized windows and zero-size
+  controls are ignored (no more clicks at (0,0) or in a random window).
+- OCR phrases must match within one OCR line; the returned box is the union of
+  the matched words (previously words from different lines could be merged).
+- `ocr --window` now crops the target window and offsets coordinates correctly.
+- `--dry-run` only resolves targets; it no longer executes assertions.
+- `backup` uses `VACUUM INTO` for a consistent snapshot and falls back to copy.
+- Report paths no longer contain `data/..`.
+- `type`/`key` with a target clicks it first to focus it.
+
 ## [0.7.1] — 2026-11-06
 
 ### Fixed

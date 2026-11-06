@@ -174,7 +174,10 @@ pub fn find_template_cancellable(
         y += step;
     }
 
-    if step > 1 && started.elapsed() <= SEARCH_BUDGET {
+    if step > 1 {
+        // Always refine around the best coarse hit; give it its own small
+        // budget so a coarse pass that used the main budget still gets sharpened.
+        let refine_started = Instant::now();
         let rx0 = best.0.saturating_sub(step).max(x0);
         let ry0 = best.1.saturating_sub(step).max(y0);
         let rx1 = (best.0 + step).min(max_x);
@@ -183,7 +186,7 @@ pub fn find_template_cancellable(
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            if started.elapsed() > SEARCH_BUDGET {
+            if refine_started.elapsed() > SEARCH_BUDGET {
                 break;
             }
             for x in rx0..=rx1 {

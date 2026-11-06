@@ -10,7 +10,7 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible,
 };
 
 #[derive(Serialize, Clone, Debug)]
@@ -141,7 +141,7 @@ fn control_type_name(id: i32) -> &'static str {
 
 unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let out = &mut *(lparam.0 as *mut Vec<HWND>);
-    if IsWindowVisible(hwnd).as_bool() {
+    if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
         out.push(hwnd);
     }
     BOOL(1)
@@ -158,18 +158,34 @@ fn window_title(hwnd: HWND) -> String {
 }
 
 fn find_window(title: &str) -> Result<HWND, String> {
+    let q = title.trim().to_lowercase();
+    if q.is_empty() {
+        return Err("window title is empty".into());
+    }
     let mut windows: Vec<HWND> = Vec::new();
     unsafe {
         let _ = EnumWindows(Some(enum_window), LPARAM(&mut windows as *mut _ as isize));
     }
-    let q = title.to_lowercase();
     for hwnd in windows {
         let t = window_title(hwnd);
-        if !t.is_empty() && (t.to_lowercase().contains(&q) || q.is_empty()) {
+        if !t.is_empty() && t.to_lowercase().contains(&q) {
             return Ok(hwnd);
         }
     }
     Err(format!("未找到窗口: {title}"))
+}
+
+pub fn window_rect(title: &str) -> Result<(i32, i32, i32, i32), String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let hwnd = find_window(title)?;
+    let mut r = windows::Win32::Foundation::RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r) }.map_err(|e| format!("GetWindowRect: {e}"))?;
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    if w <= 0 || h <= 0 {
+        return Err(format!("窗口矩形无效: {title}"));
+    }
+    Ok((r.left, r.top, w, h))
 }
 
 fn read_node(el: &IUIAutomationElement, depth: usize) -> UiaNode {
@@ -234,7 +250,7 @@ fn walk(
             .as_ref()
             .map(|s| s.matches(&node))
             .unwrap_or(true);
-        if matched && !node.offscreen {
+        if matched && !node.offscreen && node.w > 0 && node.h > 0 {
             out.push(node);
         }
         walk(walker, &el, level + 1, max_depth, max_nodes, selector, out);

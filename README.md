@@ -98,8 +98,14 @@ thresholds (0.50–0.98) are stored in `runs/thresholds.json` and adjust only
 after consecutive evidence.
 
 OCR uses the locally installed Tesseract; available languages depend on its
-`tessdata` (this machine has `eng`). UIA covers standard Win32/WPF/UWP
-controls; canvas/game UIs fall back to template or OCR.
+`tessdata` (this machine has `eng`). `ocr --window TITLE` crops that window and
+returns screen coordinates. UIA covers standard Win32/WPF/UWP controls;
+canvas/game UIs fall back to template or OCR. `--uia` requires `--window`;
+minimized windows and zero-size controls are skipped.
+
+`--dry-run` only resolves targets — it performs no actions and runs no
+assertions. In a workflow, `type`/`key` steps with a `target` click it first to
+focus it; without a target they type into the foreground window.
 
 Full-screen template search is bounded to ~3s per pass and uses a coarser scan
 for large templates. Pass `--roi x,y,w,h` (virtual-screen pixels) for large

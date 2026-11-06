@@ -293,6 +293,9 @@ fn resolve_target(
         }
         "uia" => {
             let window = t.window.as_deref().unwrap_or("");
+            if window.trim().is_empty() {
+                return Err("UIA target needs window".into());
+            }
             let sel = selector(t);
             let node = uia::find(window, &sel)?
                 .ok_or_else(|| format!("UIA target not found in {window}"))?;
@@ -465,11 +468,17 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
                             };
                             input::click(r.x, r.y, button, action == "double_click")?;
                         }
-                        "type" => {
-                            input::send_text(step.text.as_deref().unwrap_or(""))?;
-                        }
-                        "key" => {
-                            input::send_key(step.key.as_deref().unwrap_or("enter"))?;
+                        "type" | "key" => {
+                            // A target on type/key means "focus this control first".
+                            if let Some(r) = resolved.as_ref() {
+                                input::click(r.x, r.y, input::Button::Left, false)?;
+                                std::thread::sleep(std::time::Duration::from_millis(120));
+                            }
+                            if action == "type" {
+                                input::send_text(step.text.as_deref().unwrap_or(""))?;
+                            } else {
+                                input::send_key(step.key.as_deref().unwrap_or("enter"))?;
+                            }
                         }
                         "wait" => {
                             std::thread::sleep(std::time::Duration::from_millis(
@@ -480,19 +489,21 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
                         other => return Err(format!("unknown action: {other}")),
                     }
                 }
-                if let Some(expect) = &step.expect {
-                    std::thread::sleep(std::time::Duration::from_millis(120));
-                    let (ok, exp_score, exp_detail) =
-                        check_expect(&cfg, &conn, step, expect, threshold, &dir)?;
-                    if score.is_none() {
-                        score = exp_score;
-                    }
-                    detail = Some(match detail.as_ref() {
-                        Some(d) => format!("{d}; {exp_detail}"),
-                        None => exp_detail,
-                    });
-                    if !ok {
-                        return Err("expectation failed".into());
+                if !dry_run {
+                    if let Some(expect) = &step.expect {
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        let (ok, exp_score, exp_detail) =
+                            check_expect(&cfg, &conn, step, expect, threshold, &dir)?;
+                        if score.is_none() {
+                            score = exp_score;
+                        }
+                        detail = Some(match detail.as_ref() {
+                            Some(d) => format!("{d}; {exp_detail}"),
+                            None => exp_detail,
+                        });
+                        if !ok {
+                            return Err("expectation failed".into());
+                        }
                     }
                 }
                 let screen = cli::capture().unwrap_or_else(|_| {
