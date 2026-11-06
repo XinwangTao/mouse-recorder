@@ -193,6 +193,8 @@ pub fn element_group(name: &str) -> &str {
 }
 
 /// states: (is_primary, state_name, absolute image path)
+/// `primary_image_dims` is passed in (not read here) so the caller can cache
+/// disk lookups — this runs for every element on every UI frame.
 pub fn assess_element(
     name: &str,
     cx: i32,
@@ -205,6 +207,7 @@ pub fn assess_element(
     cur_sh: i32,
     states: &[(bool, &str, &Path)],
     dup_count: usize,
+    primary_image_dims: Option<(u32, u32)>,
 ) -> HealthReport {
     let mut badges = Vec::new();
     let mut hints = Vec::new();
@@ -233,13 +236,11 @@ pub fn assess_element(
         hints.push("center=(0,0)，可能未走框选录制".into());
         level = HealthLevel::Bad;
     }
-    if let Some((_, _, path)) = states.iter().find(|(p, _, _)| *p).or(states.first()) {
-        if let Ok((iw, ih)) = image::image_dimensions(path) {
-            if bw <= iw as i32 || bh <= ih as i32 {
-                badges.push("ROI小");
-                hints.push(format!("ROI {}x{} 未大于图片 {}x{}", bw, bh, iw, ih));
-                level = level.worsen(HealthLevel::Warn);
-            }
+    if let Some((iw, ih)) = primary_image_dims {
+        if bw <= iw as i32 || bh <= ih as i32 {
+            badges.push("ROI小");
+            hints.push(format!("ROI {}x{} 未大于图片 {}x{}", bw, bh, iw, ih));
+            level = level.worsen(HealthLevel::Warn);
         }
     }
     if dup_count > 1 {
@@ -276,4 +277,68 @@ pub fn scale_i(v: i32, from: i32, to: i32) -> i32 {
         return v;
     }
     ((v as i64) * (to as i64) / (from as i64)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn scale_i_handles_zero_and_negative_from() {
+        assert_eq!(scale_i(100, 1920, 2560), 133);
+        assert_eq!(scale_i(100, 0, 2560), 100);
+        assert_eq!(scale_i(100, -1, 2560), 100);
+    }
+
+    #[test]
+    fn element_group_splits_on_first_slash() {
+        assert_eq!(element_group("scene/foo"), "scene");
+        assert_eq!(element_group("scene/sub/foo"), "scene");
+        assert_eq!(element_group("plain"), "(未分组)");
+        assert_eq!(element_group("/leading"), "(未分组)");
+    }
+
+    #[test]
+    fn name_dup_counts_counts_occurrences() {
+        let m = name_dup_counts(["a", "b", "a"].into_iter());
+        assert_eq!(m.get("a"), Some(&2));
+        assert_eq!(m.get("b"), Some(&1));
+    }
+
+    #[test]
+    fn assess_flags_missing_image_and_zero_center() {
+        let p = Path::new("definitely-not-a-file-xyz.png");
+        let states = [(true, "-n", p)];
+        let r = assess_element(
+            "btn", 0, 0, 80, 40, 1920, 1080, 1920, 1080, &states, 1, None,
+        );
+        assert_eq!(r.level, HealthLevel::Bad);
+        assert!(r.badges.contains(&"缺图"));
+        assert!(r.badges.contains(&"中心0"));
+    }
+
+    #[test]
+    fn assess_uses_cached_dims_for_roi_check() {
+        let p = Path::new("definitely-not-a-file-xyz.png");
+        let states = [(true, "-n", p)];
+        let r = assess_element(
+            "btn", 100, 100, 100, 50, 1920, 1080, 1920, 1080, &states, 1,
+            Some((200, 100)),
+        );
+        assert!(r.badges.contains(&"ROI小"));
+        // Missing image is still detected by the filesystem check.
+        assert!(r.badges.contains(&"缺图"));
+    }
+
+    #[test]
+    fn assess_flags_duplicates_and_resolution_mismatch() {
+        let p = Path::new("definitely-not-a-file-xyz.png");
+        let states = [(true, "-n", p)];
+        let r = assess_element(
+            "btn", 100, 100, 200, 100, 1920, 1080, 2560, 1440, &states, 2, None,
+        );
+        assert!(r.badges.contains(&"重名"));
+        assert!(r.badges.contains(&"分辨率"));
+    }
 }

@@ -1,4 +1,6 @@
-#![windows_subsystem = "windows"]
+// Keep the release binary windowless, but let `cargo test` attach a console so
+// the harness can print results.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod matchutil;
 
@@ -39,10 +41,26 @@ struct Config {
 impl Config {
     fn load() -> Self {
         let config_path = exe_dir().join("config.toml");
-        fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|content| toml::from_str(&content).ok())
-            .unwrap_or_default()
+        match fs::read_to_string(&config_path) {
+            Ok(content) => match toml::from_str(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    log_error(&format!(
+                        "config.toml parse error ({}): {e} — using defaults",
+                        config_path.display()
+                    ));
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                log_error(&format!(
+                    "config.toml read error ({}): {e} — using defaults",
+                    config_path.display()
+                ));
+                Self::default()
+            }
+            Err(_) => Self::default(),
+        }
     }
 
     fn resolve(&self, path: &str) -> PathBuf {
@@ -436,7 +454,9 @@ fn init_db(path: &str) -> Connection {
     if let Err(e) = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_elements_name ON elements(name);
          CREATE UNIQUE INDEX IF NOT EXISTS idx_states_elem_name
-             ON element_states(element_id, state_name);",
+             ON element_states(element_id, state_name);
+         CREATE INDEX IF NOT EXISTS idx_states_element_id
+             ON element_states(element_id);",
     ) {
         log_error(&format!("unique index skipped (dup names?): {e}"));
     }
@@ -482,10 +502,15 @@ impl ElementRec {
 
 fn load_elements(conn: &Connection) -> Vec<ElementRec> {
     let mut res = Vec::new();
+    // Single LEFT JOIN instead of one state query per element (N+1): on a large
+    // library this is called on every refresh.
     let Ok(mut st) = conn.prepare(
-        "SELECT id,name,center_x,center_y,bbox_x,bbox_y,bbox_width,bbox_height,
-                screen_width,screen_height,created_at
-         FROM elements ORDER BY id",
+        "SELECT e.id,e.name,e.center_x,e.center_y,e.bbox_x,e.bbox_y,
+                e.bbox_width,e.bbox_height,e.screen_width,e.screen_height,e.created_at,
+                es.id,es.state_name,es.image_path,es.is_primary
+         FROM elements e
+         LEFT JOIN element_states es ON es.element_id = e.id
+         ORDER BY e.id, es.id",
     ) else {
         return res;
     };
@@ -502,43 +527,47 @@ fn load_elements(conn: &Connection) -> Vec<ElementRec> {
             r.get::<_, i32>(8)?,
             r.get::<_, i32>(9)?,
             r.get::<_, String>(10)?,
+            r.get::<_, Option<i32>>(11)?,
+            r.get::<_, Option<String>>(12)?,
+            r.get::<_, Option<String>>(13)?,
+            r.get::<_, Option<bool>>(14)?,
         ))
     }) else {
         return res;
     };
     for row in rows.flatten() {
-        let (id, name, cx, cy, bx, by, bw, bh, sw, sh, created_at) = row;
-        let mut states = Vec::new();
-        if let Ok(mut s2) = conn.prepare(
-            "SELECT id,state_name,image_path,is_primary FROM element_states WHERE element_id=?1 ORDER BY id",
-        ) {
-            if let Ok(r2) = s2.query_map(params![id], |r| {
-                Ok(StateRec {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    image_path: r.get(2)?,
-                    is_primary: r.get(3)?,
-                })
-            }) {
-                for st in r2.flatten() {
-                    states.push(st);
-                }
+        let (id, name, cx, cy, bx, by, bw, bh, sw, sh, created_at,
+             state_id, state_name, image_path, is_primary) = row;
+        let rec = match res.last_mut() {
+            Some(e) if e.id == id => e,
+            _ => {
+                res.push(ElementRec {
+                    id,
+                    name,
+                    cx,
+                    cy,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    screen_w: sw,
+                    screen_h: sh,
+                    created_at,
+                    states: Vec::new(),
+                });
+                res.last_mut().expect("just pushed")
             }
+        };
+        if let (Some(state_id), Some(state_name), Some(image_path)) =
+            (state_id, state_name, image_path)
+        {
+            rec.states.push(StateRec {
+                id: state_id,
+                name: state_name,
+                image_path,
+                is_primary: is_primary.unwrap_or(false),
+            });
         }
-        res.push(ElementRec {
-            id,
-            name,
-            cx,
-            cy,
-            bx,
-            by,
-            bw,
-            bh,
-            screen_w: sw,
-            screen_h: sh,
-            created_at,
-            states,
-        });
     }
     res
 }
@@ -738,7 +767,7 @@ fn rescale_element_geometry(
     update_element_geometry(conn, e.id, cx, cy, bx, by, bw, bh, new_sw, new_sh)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RoiHit {
     None,
     Center,
@@ -1279,7 +1308,12 @@ fn place_window_normal(_frame: &eframe::Frame) -> bool { false }
 
 fn escape_key_down() -> bool {
     use device_query::{DeviceQuery, DeviceState, Keycode};
-    DeviceState::new().get_keys().contains(&Keycode::Escape)
+    // Reuse one probe on the UI thread: `DeviceState::new()` is called every
+    // frame while capturing (and ~20 Hz in the ROI overlay).
+    thread_local! {
+        static DEVICE: DeviceState = DeviceState::new();
+    }
+    DEVICE.with(|d| d.get_keys().contains(&Keycode::Escape))
 }
 
 struct RecorderApp {
@@ -1316,12 +1350,17 @@ struct RecorderApp {
     preview: Option<(String, egui::TextureHandle)>,
     /// Template PNG drawn inside image-region on locate/edit overlay.
     overlay_template: Option<egui::TextureHandle>,
+    /// Cached health badges per element id; rebuilt on refresh / screen change.
+    health: std::collections::HashMap<i32, matchutil::HealthReport>,
+    /// Screen size the health cache was computed for.
+    health_screen: (u32, u32),
 }
 
 impl RecorderApp {
     fn refresh(&mut self) {
         self.elements = load_elements(&self.conn);
         self.sync_last_selection();
+        self.rebuild_health_cache();
     }
 
     fn sync_last_selection(&mut self) {
@@ -1384,7 +1423,12 @@ impl RecorderApp {
             .collect()
     }
 
-    fn health_for(&self, e: &ElementRec, dup: &std::collections::HashMap<String, usize>) -> matchutil::HealthReport {
+    fn health_for(
+        &self,
+        e: &ElementRec,
+        dup: &std::collections::HashMap<String, usize>,
+        dims: &mut std::collections::HashMap<String, Option<(u32, u32)>>,
+    ) -> matchutil::HealthReport {
         let states: Vec<(bool, &str, std::path::PathBuf)> = e
             .states
             .iter()
@@ -1401,6 +1445,13 @@ impl RecorderApp {
             .map(|(p, n, path)| (*p, *n, path.as_path()))
             .collect();
         let dup_count = dup.get(&e.name).copied().unwrap_or(1);
+        let primary_dims = e.primary_or_first_state().and_then(|s| {
+            *dims
+                .entry(s.image_path.clone())
+                .or_insert_with(|| {
+                    png_size(&std::path::Path::new(&self.image_dir).join(&s.image_path))
+                })
+        });
         matchutil::assess_element(
             &e.name,
             e.cx,
@@ -1413,7 +1464,34 @@ impl RecorderApp {
             self.sh as i32,
             &refs,
             dup_count,
+            primary_dims,
         )
+    }
+
+    /// Recompute the list badges once per data/screen change instead of doing
+    /// file stat + PNG-header reads for every element on every frame.
+    fn rebuild_health_cache(&mut self) {
+        let dups = matchutil::name_dup_counts(
+            self.elements.iter().map(|e| e.name.as_str()),
+        );
+        let mut dims = std::collections::HashMap::new();
+        let mut map = std::collections::HashMap::with_capacity(self.elements.len());
+        for e in &self.elements {
+            let report = self.health_for(e, &dups, &mut dims);
+            map.insert(e.id, report);
+        }
+        self.health = map;
+        self.health_screen = (self.sw, self.sh);
+    }
+
+    /// Lazily refresh the cache when the screen resolution changed (capture /
+    /// verify set `sw`/`sh` without a DB refresh).
+    fn ensure_health_cache(&mut self) {
+        if self.health_screen != (self.sw, self.sh)
+            || self.health.len() != self.elements.len()
+        {
+            self.rebuild_health_cache();
+        }
     }
 
     fn unique_groups(&self) -> Vec<String> {
@@ -3488,9 +3566,8 @@ impl eframe::App for RecorderApp {
 
                     let list_h = 260.0;
                     let preview_w = 300.0;
-                    let dups = matchutil::name_dup_counts(
-                        self.elements.iter().map(|e| e.name.as_str()),
-                    );
+                    self.ensure_health_cache();
+                    let idxs = self.filtered_indices();
                     ui.horizontal(|ui| {
                         let list_w = (ui.available_width() - preview_w - 12.0).max(260.0);
                         ui.vertical(|ui| {
@@ -3505,7 +3582,6 @@ impl eframe::App for RecorderApp {
                                             "No elements. Click [New Element] to record.",
                                         );
                                     }
-                                    let idxs = self.filtered_indices();
                                     if !self.elements.is_empty() && idxs.is_empty() {
                                         ui.colored_label(
                                             Color32::YELLOW,
@@ -3517,7 +3593,13 @@ impl eframe::App for RecorderApp {
                                     for &i in &idxs {
                                         let e = &self.elements[i];
                                         let selected = Some(e.id) == self.last_id;
-                                        let health = self.health_for(e, &dups);
+                                        let health = self.health.get(&e.id).cloned().unwrap_or(
+                                            matchutil::HealthReport {
+                                                level: matchutil::HealthLevel::Ok,
+                                                badges: Vec::new(),
+                                                hints: Vec::new(),
+                                            },
+                                        );
                                         let (hr, hg, hb) = health.level.color_rgb();
                                         let badge = if health.badges.is_empty() {
                                             String::new()
@@ -4148,8 +4230,125 @@ fn main() -> eframe::Result {
             pre_capture: None,
             preview: None,
             overlay_template: None,
+            health: std::collections::HashMap::new(),
+            health_screen: (0, 0),
         };
         app.sync_last_selection();
         Ok(Box::new(app))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_pad_clamps_between_floor_and_cap() {
+        assert_eq!(adaptive_roi_pad(10, 10), 12);
+        assert_eq!(adaptive_roi_pad(100, 100), 12);
+        assert_eq!(adaptive_roi_pad(1000, 1000), 40);
+    }
+
+    #[test]
+    fn image_rect_is_anchored_to_center_and_clamped() {
+        assert_eq!(image_rect_anchored(960, 540, 100, 50, 1920, 1080), (910, 515, 100, 50));
+        assert_eq!(image_rect_anchored(0, 0, 100, 50, 1920, 1080), (0, 0, 100, 50));
+    }
+
+    #[test]
+    fn pad_roi_expands_image_rect() {
+        assert_eq!(
+            pad_roi_from_image(100, 100, 50, 50, 1920, 1080, 12),
+            (88, 88, 74, 74)
+        );
+    }
+
+    #[test]
+    fn ensure_roi_grows_to_contain_image() {
+        assert_eq!(
+            ensure_roi_contains_image(100, 100, 50, 50, 120, 120, 100, 100, 1920, 1080),
+            (100, 100, 120, 120)
+        );
+    }
+
+    #[test]
+    fn roi_hit_test_center_has_priority() {
+        // Inside the center hit box wins over handle/inside logic.
+        assert_eq!(roi_hit_test(200, 200, 100, 100, 200, 200, 200, 200), RoiHit::Center);
+        assert_eq!(roi_hit_test(105, 105, 100, 100, 200, 200, 200, 200), RoiHit::NW);
+        assert_eq!(roi_hit_test(200, 100, 100, 100, 200, 200, 200, 200), RoiHit::N);
+        assert_eq!(roi_hit_test(320, 320, 100, 100, 200, 200, 200, 200), RoiHit::None);
+    }
+
+    #[test]
+    fn dragging_east_edge_only_resizes_width() {
+        let drag = RoiDrag {
+            hit: RoiHit::E,
+            start_mx: 300,
+            start_my: 200,
+            start_bx: 100,
+            start_by: 100,
+            start_bw: 200,
+            start_bh: 200,
+            start_cx: 200,
+            start_cy: 200,
+        };
+        assert_eq!(
+            apply_roi_drag(&drag, 350, 200, 1920, 1080),
+            (100, 100, 250, 200, 200, 200)
+        );
+    }
+
+    #[test]
+    fn dragging_center_moves_target_not_roi() {
+        let drag = RoiDrag {
+            hit: RoiHit::Center,
+            start_mx: 200,
+            start_my: 200,
+            start_bx: 100,
+            start_by: 100,
+            start_bw: 200,
+            start_bh: 200,
+            start_cx: 200,
+            start_cy: 200,
+        };
+        assert_eq!(
+            apply_roi_drag(&drag, 210, 190, 1920, 1080),
+            (100, 100, 200, 200, 210, 190)
+        );
+    }
+
+    #[test]
+    fn state_suffix_cycles_and_falls_back() {
+        assert_eq!(get_next_state_suffix("-n"), "-s");
+        assert_eq!(get_next_state_suffix("-p"), "-n");
+        assert_eq!(get_next_state_suffix("-cs"), "-n");
+    }
+
+    #[test]
+    fn load_elements_groups_states_in_id_order() {
+        let conn = init_db(":memory:");
+        let id1 = create_elem(
+            &conn, "a", "-n", 10, 10, 60, 40, "a_-n.png", 1920, 1080,
+        )
+        .unwrap();
+        create_elem(
+            &conn, "b", "-n", 110, 110, 160, 140, "b_-n.png", 1920, 1080,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at)
+             VALUES(?1,'-s','a_-s.png',0,'x')",
+            params![id1],
+        )
+        .unwrap();
+
+        let els = load_elements(&conn);
+        assert_eq!(els.len(), 2);
+        assert_eq!(els[0].states.len(), 2);
+        assert_eq!(els[0].states[0].name, "-n");
+        assert_eq!(els[0].states[1].name, "-s");
+        assert!(els[0].states[0].is_primary);
+        assert_eq!(els[1].states.len(), 1);
+    }
 }

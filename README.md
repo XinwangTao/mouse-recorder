@@ -215,3 +215,19 @@ cargo build --release
 ```
 
 Requires Rust stable. The `unstable_grab` feature of `rdev` is enabled for event interception — no elevated privileges required on Windows.
+
+### Tests
+
+```
+cargo test
+```
+
+Pure helpers (ROI math, health assessment, DB loading) are covered by unit tests; no display or recorded data is needed.
+
+### Performance notes
+
+- The element list renders from a cached health report per element (image existence + PNG dimensions are read on refresh/screen change, not every frame).
+- State loading uses one `LEFT JOIN` query instead of one query per element.
+- `element_states(element_id)` is indexed.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
