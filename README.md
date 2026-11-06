@@ -101,6 +101,10 @@ OCR uses the locally installed Tesseract; available languages depend on its
 `tessdata` (this machine has `eng`). UIA covers standard Win32/WPF/UWP
 controls; canvas/game UIs fall back to template or OCR.
 
+Full-screen template search is bounded to ~3s per pass and uses a coarser scan
+for large templates. Pass `--roi x,y,w,h` (virtual-screen pixels) for large
+templates or when you know the target region.
+
 ---
 
 ## Recording Elements

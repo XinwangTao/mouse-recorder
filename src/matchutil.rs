@@ -3,6 +3,11 @@
 use image::{ImageBuffer, Rgba};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Upper bound for one coarse/refine pass. Large templates with no ROI can
+/// otherwise scan billions of pixels; the caller gets the best hit found so far.
+const SEARCH_BUDGET: Duration = Duration::from_secs(3);
 
 /// Same score as mouse-suite clicker: 1 - mean(|ΔRGB|) / (255*3).
 ///
@@ -141,7 +146,9 @@ pub fn find_template_cancellable(
 
     let max_x = x1 - tw;
     let max_y = y1 - th;
-    let step = ((tw.min(th) / 16).max(1)).min(4);
+    // Large templates get a coarser coarse pass (refine still covers the gap).
+    let step = ((tw.min(th) / 16).max(1)).min(8);
+    let started = Instant::now();
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best = (x0, y0);
@@ -150,6 +157,9 @@ pub fn find_template_cancellable(
     while y <= max_y {
         if cancel.load(Ordering::Relaxed) {
             return None;
+        }
+        if started.elapsed() > SEARCH_BUDGET {
+            break;
         }
         let mut x = x0;
         while x <= max_x {
@@ -164,7 +174,7 @@ pub fn find_template_cancellable(
         y += step;
     }
 
-    if step > 1 {
+    if step > 1 && started.elapsed() <= SEARCH_BUDGET {
         let rx0 = best.0.saturating_sub(step).max(x0);
         let ry0 = best.1.saturating_sub(step).max(y0);
         let rx1 = (best.0 + step).min(max_x);
@@ -172,6 +182,9 @@ pub fn find_template_cancellable(
         for y in ry0..=ry1 {
             if cancel.load(Ordering::Relaxed) {
                 return None;
+            }
+            if started.elapsed() > SEARCH_BUDGET {
+                break;
             }
             for x in rx0..=rx1 {
                 if let Some(s) = score_at_above(screen, template, x, y, best_score) {

@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.1] — 2026-11-06
+
+### Fixed
+- Full-screen template searches are bounded to a ~3s budget per pass and use a
+  coarser coarse pass for large templates. A 600×200 template with no ROI could
+  previously run for minutes; it now returns the best hit found and exits 3 when
+  below threshold. Prefer `--roi` for large templates.
+
 ## [0.7.0] — 2026-11-06
 
 ### Added
