@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -177,25 +177,31 @@ fn get_next_state_suffix(current: &str) -> String {
     "-n".to_string()
 }
 
+/// Bounding box of all monitors in virtual-screen coordinates. The origin can
+/// be negative when a monitor sits left/above the primary.
 #[cfg(windows)]
-fn screen_size_px() -> (u32, u32) {
+fn virtual_screen_rect() -> (i32, i32, u32, u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
     };
     unsafe {
-        let w = GetSystemMetrics(SM_CXSCREEN);
-        let h = GetSystemMetrics(SM_CYSCREEN);
-        if w > 0 && h > 0 {
-            (w as u32, h as u32)
-        } else {
-            (1920, 1080)
-        }
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32;
+        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32;
+        (x, y, w, h)
     }
 }
 
 #[cfg(not(windows))]
+fn virtual_screen_rect() -> (i32, i32, u32, u32) {
+    (0, 0, 1920, 1080)
+}
+
 fn screen_size_px() -> (u32, u32) {
-    (1920, 1080)
+    let (_, _, w, h) = virtual_screen_rect();
+    (w, h)
 }
 
 fn get_resolution() -> (u32, u32) {
@@ -212,7 +218,7 @@ fn grab_screen_gdi() -> Result<image::RgbaImage, String> {
         SRCCOPY,
     };
 
-    let (w_u, h_u) = screen_size_px();
+    let (vx, vy, w_u, h_u) = virtual_screen_rect();
     let w = w_u as i32;
     let h = h_u as i32;
 
@@ -233,7 +239,8 @@ fn grab_screen_gdi() -> Result<image::RgbaImage, String> {
             return Err("CreateCompatibleBitmap failed".into());
         }
         let old = SelectObject(hdc_mem, hbmp as _);
-        if BitBlt(hdc_mem, 0, 0, w, h, hdc, 0, 0, SRCCOPY) == 0 {
+        // Source coords are virtual-screen pixels (may be negative).
+        if BitBlt(hdc_mem, 0, 0, w, h, hdc, vx, vy, SRCCOPY) == 0 {
             SelectObject(hdc_mem, old);
             DeleteObject(hbmp as _);
             DeleteDC(hdc_mem);
@@ -290,7 +297,7 @@ fn grab_screen_gdi() -> Result<image::RgbaImage, String> {
     Err("Screen capture only supported on Windows".into())
 }
 
-fn grab_primary_monitor() -> Result<image::RgbaImage, String> {
+fn grab_virtual_desktop() -> Result<image::RgbaImage, String> {
     grab_screen_gdi()
 }
 
@@ -344,13 +351,38 @@ fn state_exists(conn: &Connection, element_id: i32, state: &str) -> bool {
     .is_ok()
 }
 
-/// Replace `dest` with `temp` without deleting the old file until the new one is in place.
-fn place_image_at(temp: &str, dest: &str) -> Result<String, String> {
-    if temp == dest {
-        return Ok(dest.to_string());
+/// A placed image whose previous version is held in `.png.bak` until the
+/// caller commits the matching DB transaction.
+struct PlacedImage {
+    dest: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl PlacedImage {
+    fn commit(mut self) {
+        if let Some(b) = self.backup.take() {
+            let _ = fs::remove_file(b);
+        }
     }
-    let dest_path = std::path::Path::new(dest);
+
+    fn rollback(mut self) {
+        let _ = fs::remove_file(&self.dest);
+        if let Some(b) = self.backup.take() {
+            let _ = fs::rename(&b, &self.dest);
+        }
+    }
+}
+
+/// Replace `dest` with `temp`, keeping the old file until [`PlacedImage::commit`].
+fn place_image_hold(temp: &str, dest: &str) -> Result<PlacedImage, String> {
+    let dest_path = PathBuf::from(dest);
     let temp_path = std::path::Path::new(temp);
+    if temp_path == dest_path {
+        return Ok(PlacedImage {
+            dest: dest_path,
+            backup: None,
+        });
+    }
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -358,33 +390,27 @@ fn place_image_at(temp: &str, dest: &str) -> Result<String, String> {
     let bak = dest_path.with_extension("png.bak");
     let had_dest = dest_path.exists();
     if had_dest {
-        if bak.exists() {
-            let _ = fs::remove_file(&bak);
-        }
-        fs::rename(dest_path, &bak).map_err(|e| format!("backup old image: {e}"))?;
+        let _ = fs::remove_file(&bak);
+        fs::rename(&dest_path, &bak).map_err(|e| format!("backup old image: {e}"))?;
     }
 
-    let placed = match fs::rename(temp_path, dest_path) {
+    let placed = match fs::rename(temp_path, &dest_path) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(temp_path, dest_path)
-                .map(|_| {
-                    let _ = fs::remove_file(temp_path);
-                })
-                .map_err(|e| format!("copy image: {e}"))
-        }
+        Err(_) => fs::copy(temp_path, &dest_path)
+            .map(|_| {
+                let _ = fs::remove_file(temp_path);
+            })
+            .map_err(|e| format!("copy image: {e}")),
     };
 
     match placed {
-        Ok(()) => {
-            if had_dest {
-                let _ = fs::remove_file(&bak);
-            }
-            Ok(dest.to_string())
-        }
+        Ok(()) => Ok(PlacedImage {
+            dest: dest_path,
+            backup: if had_dest { Some(bak) } else { None },
+        }),
         Err(e) => {
             if had_dest {
-                let _ = fs::rename(&bak, dest_path);
+                let _ = fs::rename(&bak, &dest_path);
             }
             Err(e)
         }
@@ -399,9 +425,11 @@ fn overwrite_elem(
     y1: i32,
     x2: i32,
     y2: i32,
-    img: &str,
+    db_img: &str,
     sw: u32,
     sh: u32,
+    origin_x: i32,
+    origin_y: i32,
 ) -> Result<(), String> {
     let ix = x1.min(x2);
     let iy = y1.min(y2);
@@ -412,33 +440,57 @@ fn overwrite_elem(
     let (bx, by, bw, bh) =
         pad_roi_from_image(ix, iy, iw, ih, sw as i32, sh as i32, adaptive_roi_pad(iw, ih));
     let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let fname = std::path::Path::new(img)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(img)
-        .to_string();
 
     conn.execute(
         "UPDATE elements SET center_x=?1, center_y=?2, bbox_x=?3, bbox_y=?4,
-         bbox_width=?5, bbox_height=?6, screen_width=?7, screen_height=?8 WHERE id=?9",
-        params![cx, cy, bx, by, bw, bh, sw, sh, id],
+         bbox_width=?5, bbox_height=?6, screen_width=?7, screen_height=?8,
+         origin_x=?9, origin_y=?10 WHERE id=?11",
+        params![cx, cy, bx, by, bw, bh, sw, sh, origin_x, origin_y, id],
     )
     .map_err(|e| e.to_string())?;
 
     if state_exists(conn, id, state) {
         conn.execute(
             "UPDATE element_states SET image_path=?1, created_at=?2 WHERE element_id=?3 AND state_name=?4",
-            params![fname, ts, id, state],
+            params![db_img, ts, id, state],
         )
         .map_err(|e| e.to_string())?;
     } else {
         conn.execute(
             "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,0,?4)",
-            params![id, state, fname, ts],
+            params![id, state, db_img, ts],
         )
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let Ok(mut st) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    let names: Vec<String> = match st.query_map([], |r| r.get::<_, String>(1)) {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => return false,
+    };
+    names.iter().any(|c| c == column)
+}
+
+/// Add columns introduced after the initial schema (SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`).
+fn ensure_element_columns(conn: &Connection) {
+    for (col, ddl) in [
+        ("origin_x", "INTEGER NOT NULL DEFAULT 0"),
+        ("origin_y", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !table_has_column(conn, "elements", col) {
+            if let Err(e) = conn.execute_batch(&format!(
+                "ALTER TABLE elements ADD COLUMN {col} {ddl};"
+            )) {
+                log_error(&format!("add elements.{col}: {e}"));
+            }
+        }
+    }
 }
 
 fn init_db(path: &str) -> Connection {
@@ -468,6 +520,7 @@ fn init_db(path: &str) -> Connection {
             bbox_x INTEGER NOT NULL, bbox_y INTEGER NOT NULL,
             bbox_width INTEGER NOT NULL, bbox_height INTEGER NOT NULL,
             screen_width INTEGER NOT NULL, screen_height INTEGER NOT NULL,
+            origin_x INTEGER NOT NULL DEFAULT 0, origin_y INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS element_states (
@@ -492,6 +545,7 @@ fn init_db(path: &str) -> Connection {
     ) {
         log_error(&format!("unique index skipped (dup names?): {e}"));
     }
+    ensure_element_columns(&conn);
     conn
 }
 
@@ -515,6 +569,9 @@ struct ElementRec {
     bh: i32,
     screen_w: i32,
     screen_h: i32,
+    /// Virtual-screen origin at capture time (screen = image + origin).
+    origin_x: i32,
+    origin_y: i32,
     created_at: String,
     states: Vec<StateRec>,
 }
@@ -536,14 +593,27 @@ fn load_elements(conn: &Connection) -> Vec<ElementRec> {
     let mut res = Vec::new();
     // Single LEFT JOIN instead of one state query per element (N+1): on a large
     // library this is called on every refresh.
-    let Ok(mut st) = conn.prepare(
+    let select_with_origin =
         "SELECT e.id,e.name,e.center_x,e.center_y,e.bbox_x,e.bbox_y,
                 e.bbox_width,e.bbox_height,e.screen_width,e.screen_height,e.created_at,
+                e.origin_x,e.origin_y,
                 es.id,es.state_name,es.image_path,es.is_primary
          FROM elements e
          LEFT JOIN element_states es ON es.element_id = e.id
-         ORDER BY e.id, es.id",
-    ) else {
+         ORDER BY e.id, es.id";
+    // A read-only / un-migratable DB may lack the origin columns; keep loading.
+    let select_without_origin =
+        "SELECT e.id,e.name,e.center_x,e.center_y,e.bbox_x,e.bbox_y,
+                e.bbox_width,e.bbox_height,e.screen_width,e.screen_height,e.created_at,
+                0 AS origin_x,0 AS origin_y,
+                es.id,es.state_name,es.image_path,es.is_primary
+         FROM elements e
+         LEFT JOIN element_states es ON es.element_id = e.id
+         ORDER BY e.id, es.id";
+    let Ok(mut st) = conn
+        .prepare(select_with_origin)
+        .or_else(|_| conn.prepare(select_without_origin))
+    else {
         return res;
     };
     let Ok(rows) = st.query_map([], |r| {
@@ -559,16 +629,18 @@ fn load_elements(conn: &Connection) -> Vec<ElementRec> {
             r.get::<_, i32>(8)?,
             r.get::<_, i32>(9)?,
             r.get::<_, String>(10)?,
-            r.get::<_, Option<i32>>(11)?,
-            r.get::<_, Option<String>>(12)?,
-            r.get::<_, Option<String>>(13)?,
-            r.get::<_, Option<bool>>(14)?,
+            r.get::<_, i32>(11)?,
+            r.get::<_, i32>(12)?,
+            r.get::<_, Option<i32>>(13)?,
+            r.get::<_, Option<String>>(14)?,
+            r.get::<_, Option<String>>(15)?,
+            r.get::<_, Option<bool>>(16)?,
         ))
     }) else {
         return res;
     };
     for row in rows.flatten() {
-        let (id, name, cx, cy, bx, by, bw, bh, sw, sh, created_at,
+        let (id, name, cx, cy, bx, by, bw, bh, sw, sh, created_at, ox, oy,
              state_id, state_name, image_path, is_primary) = row;
         let rec = match res.last_mut() {
             Some(e) if e.id == id => e,
@@ -584,6 +656,8 @@ fn load_elements(conn: &Connection) -> Vec<ElementRec> {
                     bh,
                     screen_w: sw,
                     screen_h: sh,
+                    origin_x: ox,
+                    origin_y: oy,
                     created_at,
                     states: Vec::new(),
                 });
@@ -710,13 +784,16 @@ fn update_element_geometry(
     bh: i32,
     screen_w: i32,
     screen_h: i32,
+    origin_x: i32,
+    origin_y: i32,
 ) -> Result<(), String> {
     let bw = bw.max(1);
     let bh = bh.max(1);
     conn.execute(
         "UPDATE elements SET center_x=?1, center_y=?2, bbox_x=?3, bbox_y=?4,
-         bbox_width=?5, bbox_height=?6, screen_width=?7, screen_height=?8 WHERE id=?9",
-        params![cx, cy, bx, by, bw, bh, screen_w, screen_h, id],
+         bbox_width=?5, bbox_height=?6, screen_width=?7, screen_height=?8,
+         origin_x=?9, origin_y=?10 WHERE id=?11",
+        params![cx, cy, bx, by, bw, bh, screen_w, screen_h, origin_x, origin_y, id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -770,6 +847,9 @@ fn rename_element(
         if !old_path.exists() {
             continue;
         }
+        if let Some(parent) = new_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let moved_ok = match fs::rename(old_path, new_path) {
             Ok(()) => Ok(()),
             Err(e) => match fs::copy(old_path, new_path) {
@@ -821,6 +901,8 @@ fn rescale_element_geometry(
     e: &ElementRec,
     new_sw: i32,
     new_sh: i32,
+    origin_x: i32,
+    origin_y: i32,
 ) -> Result<(), String> {
     if e.screen_w <= 0 || e.screen_h <= 0 {
         return Err("录制分辨率为 0，无法缩放".into());
@@ -834,7 +916,9 @@ fn rescale_element_geometry(
     let by = matchutil::scale_i(e.by, e.screen_h, new_sh);
     let bw = matchutil::scale_i(e.bw, e.screen_w, new_sw).max(1);
     let bh = matchutil::scale_i(e.bh, e.screen_h, new_sh).max(1);
-    update_element_geometry(conn, e.id, cx, cy, bx, by, bw, bh, new_sw, new_sh)
+    update_element_geometry(
+        conn, e.id, cx, cy, bx, by, bw, bh, new_sw, new_sh, origin_x, origin_y,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1090,20 +1174,59 @@ fn export_csv(conn: &Connection, name: &str, cfg: &Config) -> Result<String, Str
     let path_s = path.to_string_lossy().to_string();
     let mut f = fs::File::create(&path).map_err(|e| e.to_string())?;
     f.write_all(b"\xEF\xBB\xBF").map_err(|e| e.to_string())?;
-    writeln!(f, "id,x,y,description,template_path,original_width,original_height").map_err(|e| e.to_string())?;
+    writeln!(f, "id,x,y,description,template_path,original_width,original_height,origin_x,origin_y").map_err(|e| e.to_string())?;
     let mut st = conn.prepare(
-        "SELECT e.id,e.name,e.center_x,e.center_y,es.image_path,e.screen_width,e.screen_height
+        "SELECT e.id,e.name,e.center_x,e.center_y,es.image_path,e.screen_width,e.screen_height,
+                e.origin_x,e.origin_y
          FROM elements e JOIN element_states es ON e.id=es.element_id AND es.is_primary=1 ORDER BY e.id"
     ).map_err(|e| e.to_string())?;
-    for row in st.query_map([], |r| Ok((r.get::<_,i32>(0)?, r.get::<_,String>(1)?, r.get::<_,i32>(2)?, r.get::<_,i32>(3)?, r.get::<_,String>(4)?, r.get::<_,i32>(5)?, r.get::<_,i32>(6)?))).map_err(|e| e.to_string())?.flatten() {
-        let (id, name, cx, cy, img, sw, sh) = row;
+    for row in st.query_map([], |r| Ok((r.get::<_,i32>(0)?, r.get::<_,String>(1)?, r.get::<_,i32>(2)?, r.get::<_,i32>(3)?, r.get::<_,String>(4)?, r.get::<_,i32>(5)?, r.get::<_,i32>(6)?, r.get::<_,i32>(7)?, r.get::<_,i32>(8)?))).map_err(|e| e.to_string())?.flatten() {
+        let (id, name, cx, cy, img, sw, sh, ox, oy) = row;
         let img_path = std::path::Path::new(&out_dir).join(&img).to_string_lossy().to_string();
-        writeln!(f, "{},{},{},\"{}\",\"{}\",{},{}", id, cx, cy, name.replace('"', "\"\""), img_path.replace('"', "\"\""), sw, sh).map_err(|e| e.to_string())?;
+        // x/y are virtual-screen pixels: image-relative center + capture origin.
+        writeln!(f, "{},{},{},\"{}\",\"{}\",{},{},{},{}", id, cx + ox, cy + oy, name.replace('"', "\"\""), img_path.replace('"', "\"\""), sw, sh, ox, oy).map_err(|e| e.to_string())?;
     }
     Ok(path_s)
 }
 
-fn create_elem(conn: &Connection, name: &str, state: &str, x1: i32, y1: i32, x2: i32, y2: i32, img: &str, sw: u32, sh: u32) -> Result<i32, String> {
+#[allow(dead_code)] // transactional wrapper used by tests; production joins the caller's tx
+fn create_elem(
+    conn: &Connection,
+    name: &str,
+    state: &str,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    db_img: &str,
+    sw: u32,
+    sh: u32,
+    origin_x: i32,
+    origin_y: i32,
+) -> Result<i32, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let id = create_elem_in_tx(
+        &tx, name, state, x1, y1, x2, y2, db_img, sw, sh, origin_x, origin_y,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Same as [`create_elem`] but joins a transaction owned by the caller.
+fn create_elem_in_tx(
+    conn: &Connection,
+    name: &str,
+    state: &str,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    db_img: &str,
+    sw: u32,
+    sh: u32,
+    origin_x: i32,
+    origin_y: i32,
+) -> Result<i32, String> {
     let ix = x1.min(x2);
     let iy = y1.min(y2);
     let iw = (x1 - x2).abs();
@@ -1113,27 +1236,128 @@ fn create_elem(conn: &Connection, name: &str, state: &str, x1: i32, y1: i32, x2:
     let (bx, by, bw, bh) =
         pad_roi_from_image(ix, iy, iw, ih, sw as i32, sh as i32, adaptive_roi_pad(iw, ih));
     let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let fname = std::path::Path::new(img).file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(img)
-        .to_string();
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute(
-        "INSERT INTO elements(name,center_x,center_y,bbox_x,bbox_y,bbox_width,bbox_height,screen_width,screen_height,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![name, cx, cy, bx, by, bw, bh, sw, sh, ts]
+    conn.execute(
+        "INSERT INTO elements(name,center_x,center_y,bbox_x,bbox_y,bbox_width,bbox_height,screen_width,screen_height,origin_x,origin_y,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![name, cx, cy, bx, by, bw, bh, sw, sh, origin_x, origin_y, ts]
     ).map_err(|e| e.to_string())?;
-    let id = tx.last_insert_rowid() as i32;
-    tx.execute(
+    let id = conn.last_insert_rowid() as i32;
+    conn.execute(
         "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,1,?4)",
-        params![id, state, fname, ts]
+        params![id, state, db_img, ts]
     ).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+/// Store image paths relative to `image_dir` (forward slashes), so grouped
+/// names such as `scene/foo` round-trip. Absolute paths outside the image dir
+/// are kept as-is for legacy callers.
+fn db_image_path(image_dir: &str, dest: &str) -> String {
+    let base = std::path::Path::new(image_dir);
+    let p = std::path::Path::new(dest);
+    match p.strip_prefix(base) {
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            rel.to_string_lossy().replace('\\', "/")
+        }
+        _ => dest.to_string(),
+    }
+}
+
+fn collect_png_paths(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    depth: usize,
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_png_paths(&p, base, depth + 1, out);
+        } else if p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("png"))
+            .unwrap_or(false)
+        {
+            if let (Some(name), Ok(rel)) = (
+                p.file_name().and_then(|n| n.to_str()),
+                p.strip_prefix(base),
+            ) {
+                out.entry(name.to_string())
+                    .or_insert_with(|| rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+}
+
+/// Legacy rows stored only the basename while the file actually lives in a
+/// group subdirectory. Point them at the relative path when the basename is
+/// ambiguous/missing at the root.
+fn migrate_image_paths(conn: &Connection, image_dir: &str) {
+    let base = std::path::Path::new(image_dir);
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    if let Ok(mut st) = conn.prepare("SELECT id, image_path FROM element_states") {
+        if let Ok(m) = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) {
+            rows.extend(m.flatten());
+        }
+    }
+    let missing: Vec<(i64, String)> = rows
+        .into_iter()
+        .filter(|(_, p)| !base.join(p).exists())
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut index = std::collections::HashMap::new();
+    collect_png_paths(base, base, 0, &mut index);
+    let mut fixed = 0usize;
+    for (id, path) in missing {
+        let Some(name) = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+        else {
+            continue;
+        };
+        if let Some(rel) = index.get(name) {
+            if conn
+                .execute(
+                    "UPDATE element_states SET image_path=?1 WHERE id=?2",
+                    params![rel, id],
+                )
+                .is_ok()
+            {
+                fixed += 1;
+            }
+        }
+    }
+    if fixed > 0 {
+        log_error(&format!(
+            "migrated {fixed} element image path(s) to relative form"
+        ));
+    }
+}
+
+struct VerifyOutcome {
+    element_id: i32,
+    generation: u64,
+    hit: Option<matchutil::MatchHit>,
+    template_w: i32,
+    template_h: i32,
 }
 
 enum AppMode {
     Normal,
     Capturing,
+    /// Fullscreen progress while a worker thread runs template matching.
+    VerifyingMatch {
+        #[allow(dead_code)]
+        started_at: std::time::Instant,
+    },
     InputName(i32, i32, i32, i32, String),
     InputState(i32, i32, i32, i32, String, String, String),
     /// Name/image already exists — ask before overwriting DB + PNG.
@@ -1409,6 +1633,8 @@ struct RecorderApp {
     last_state_name: Option<String>,
     is_add_state_mode: bool,
     sw: u32, sh: u32,
+    /// Virtual-screen origin of the captured desktop (screen = image + origin).
+    origin: (i32, i32),
     scale: f32,
     mode: AppMode,
     input: String,
@@ -1434,6 +1660,12 @@ struct RecorderApp {
     preview: Option<(String, egui::TextureHandle)>,
     /// Template PNG drawn inside image-region on locate/edit overlay.
     overlay_template: Option<egui::TextureHandle>,
+    /// Desktop snapshot for the verify overlay.
+    verify_bg: Option<egui::TextureHandle>,
+    /// Result channel from the background matcher.
+    verify_rx: Option<mpsc::Receiver<VerifyOutcome>>,
+    /// Invalidates late results after cancel / a newer verify.
+    verify_gen: u64,
     /// Cached health badges per element id; rebuilt on refresh / screen change.
     health: std::collections::HashMap<i32, matchutil::HealthReport>,
     /// Screen size the health cache was computed for.
@@ -1441,6 +1673,29 @@ struct RecorderApp {
 }
 
 impl RecorderApp {
+    fn refresh_origin(&mut self) {
+        let (x, y, _, _) = virtual_screen_rect();
+        self.origin = (x, y);
+    }
+
+    /// Window position for a fullscreen overlay covering the virtual desktop.
+    fn overlay_pos_logical(&self) -> egui::Pos2 {
+        let s = self.scale.max(0.1);
+        egui::pos2(self.origin.0 as f32 / s, self.origin.1 as f32 / s)
+    }
+
+    /// rdev reports virtual-screen pixels; internally everything is image-relative.
+    fn screen_to_image(&self, x: f64, y: f64) -> (i32, i32) {
+        (x as i32 - self.origin.0, y as i32 - self.origin.1)
+    }
+
+    /// Desktop snapshot used by the ROI/verify overlays.
+    fn bg_texture(&self) -> Option<&egui::TextureHandle> {
+        self.verify_bg
+            .as_ref()
+            .or_else(|| self.pre_capture.as_ref().map(|(t, _)| t))
+    }
+
     fn refresh(&mut self) {
         self.elements = load_elements(&self.conn);
         self.sync_last_selection();
@@ -1722,10 +1977,14 @@ impl RecorderApp {
         let (ix, iy, _, _) =
             image_rect_anchored(e.cx, e.cy, iw as i32, ih as i32, e.screen_w, e.screen_h);
         format!(
-            "name={}\ncenter=({}, {})\nimage_rect=[{}, {}, {}, {}]  (x,y,w,h)\nroi=[{}, {}, {}, {}]  (x,y,w,h)\nroi_end=({}, {})\nimage_size={}x{}\nscreen={}x{}\nstate={}\nimage={}",
+            "name={}\ncenter=({}, {})  (image coords)\nscreen_center=({}, {})\norigin=({}, {})\nimage_rect=[{}, {}, {}, {}]  (x,y,w,h)\nroi=[{}, {}, {}, {}]  (x,y,w,h)\nroi_end=({}, {})\nimage_size={}x{}\nscreen={}x{}\nstate={}\nimage={}",
             e.name,
             e.cx,
             e.cy,
+            e.cx + e.origin_x,
+            e.cy + e.origin_y,
+            e.origin_x,
+            e.origin_y,
             ix,
             iy,
             iw,
@@ -1754,7 +2013,8 @@ impl RecorderApp {
             let _ = park_window_offscreen(frame);
             thread::sleep(Duration::from_millis(60));
         }
-        let img = grab_primary_monitor()?;
+        self.refresh_origin();
+        let img = grab_virtual_desktop()?;
         self.sw = img.width();
         self.sh = img.height();
         self.scale = ctx.pixels_per_point().max(0.1);
@@ -1818,10 +2078,15 @@ impl RecorderApp {
     ) -> (i32, i32, i32, i32, i32, i32) {
         let screen_w = self.sw as i32;
         let screen_h = self.sh as i32;
+        // Rebase from the capture origin to the current virtual desktop.
+        let dx = e.origin_x - self.origin.0;
+        let dy = e.origin_y - self.origin.1;
+        let cx = e.cx + dx;
+        let cy = e.cy + dy;
         let (ix, iy, iw, ih) =
-            image_rect_anchored(e.cx, e.cy, img_w, img_h, screen_w, screen_h);
-        let mut bx = e.bx;
-        let mut by = e.by;
+            image_rect_anchored(cx, cy, img_w, img_h, screen_w, screen_h);
+        let mut bx = e.bx + dx;
+        let mut by = e.by + dy;
         let mut bw = e.bw.max(ROI_MIN_SIZE);
         let mut bh = e.bh.max(ROI_MIN_SIZE);
         if bw < iw + 2 || bh < ih + 2 {
@@ -1840,7 +2105,7 @@ impl RecorderApp {
             bw = nbw;
             bh = nbh;
         }
-        (bx, by, bw, bh, e.cx, e.cy)
+        (bx, by, bw, bh, cx, cy)
     }
 
     /// Refresh overlay geometry/template for current selection (keep desktop bg).
@@ -1990,7 +2255,7 @@ impl RecorderApp {
         // Size/pos: egui ViewportCommand only (logical). Win32 only toggles TOPMOST.
         ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.overlay_pos_logical()));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_w, logical_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2040,6 +2305,7 @@ impl RecorderApp {
             }
             _ => return,
         };
+        let (ox, oy) = self.origin;
         match update_element_geometry(
             &self.conn,
             id,
@@ -2051,6 +2317,8 @@ impl RecorderApp {
             bh,
             self.sw as i32,
             self.sh as i32,
+            ox,
+            oy,
         ) {
             Ok(()) => {
                 self.refresh();
@@ -2087,7 +2355,8 @@ impl RecorderApp {
             thread::sleep(Duration::from_millis(60));
         }
 
-        let img = match grab_primary_monitor() {
+        self.refresh_origin();
+        let img = match grab_virtual_desktop() {
             Ok(img) => img,
             Err(e) => {
                 self.mode = AppMode::Normal;
@@ -2133,7 +2402,7 @@ impl RecorderApp {
         let logical_w = self.sw as f32 / self.scale;
         let logical_h = self.sh as f32 / self.scale;
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.overlay_pos_logical()));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_w, logical_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2226,72 +2495,63 @@ impl RecorderApp {
             .join(format!("{}_{}.png", name, state_name))
             .to_string_lossy()
             .to_string();
-        // DB first with planned final path; only then replace the PNG so a failed
-        // insert/update never leaves a replaced image with stale metadata.
-        let planned = dest.clone();
+        let db_img = db_image_path(&self.image_dir, &dest);
+        let (ox, oy) = self.origin;
+        let (sw, sh) = (self.sw, self.sh);
 
-        let result = if is_add_state {
+        // Hold DB changes in a transaction while the PNG is staged with its old
+        // version kept in .bak. Commit DB first, then drop the backup; any
+        // failure rolls back whichever side already moved.
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+
+        let (msg, new_id) = if is_add_state {
             let id = existing_id
                 .or(self.last_id)
                 .ok_or_else(|| "No element selected".to_string())?;
-            if overwrite || state_exists(&self.conn, id, state_name) {
+            if overwrite || state_exists(&tx, id, state_name) {
                 overwrite_elem(
-                    &self.conn, id, state_name, x1, y1, x2, y2, &planned, self.sw, self.sh,
+                    &tx, id, state_name, x1, y1, x2, y2, &db_img, sw, sh, ox, oy,
                 )?;
             } else {
-                let fname = std::path::Path::new(&planned)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&planned)
-                    .to_string();
                 let ts = Local::now().format("%Y%m%d_%H%M%S").to_string();
-                self.conn
-                    .execute(
-                        "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,0,?4)",
-                        params![id, state_name, fname, ts],
-                    )
-                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at) VALUES(?1,?2,?3,0,?4)",
+                    params![id, state_name, db_img, ts],
+                )
+                .map_err(|e| e.to_string())?;
             }
-            self.last_id = Some(id);
-            self.last_element_name = Some(name.to_string());
-            self.last_state_name = Some(state_name.to_string());
-            Ok(format!("State '{}' saved (#{})", state_name, id))
+            (format!("State '{}' saved (#{})", state_name, id), id)
         } else if overwrite {
-            if let Some(id) = existing_id.or_else(|| find_element_id_by_name(&self.conn, name)) {
+            if let Some(id) = existing_id.or_else(|| find_element_id_by_name(&tx, name)) {
                 overwrite_elem(
-                    &self.conn, id, state_name, x1, y1, x2, y2, &planned, self.sw, self.sh,
+                    &tx, id, state_name, x1, y1, x2, y2, &db_img, sw, sh, ox, oy,
                 )?;
-                self.last_id = Some(id);
-                self.last_element_name = Some(name.to_string());
-                self.last_state_name = Some(state_name.to_string());
-                Ok(format!("Element #{} overwritten!", id))
+                (format!("Element #{} overwritten!", id), id)
             } else {
-                let id = create_elem(
-                    &self.conn, name, state_name, x1, y1, x2, y2, &planned, self.sw, self.sh,
+                let id = create_elem_in_tx(
+                    &tx, name, state_name, x1, y1, x2, y2, &db_img, sw, sh, ox, oy,
                 )?;
-                self.last_id = Some(id);
-                self.last_element_name = Some(name.to_string());
-                self.last_state_name = Some(state_name.to_string());
-                Ok(format!("Element #{} created (replaced image)!", id))
+                (format!("Element #{} created (replaced image)!", id), id)
             }
         } else {
-            let id = create_elem(
-                &self.conn, name, state_name, x1, y1, x2, y2, &planned, self.sw, self.sh,
+            let id = create_elem_in_tx(
+                &tx, name, state_name, x1, y1, x2, y2, &db_img, sw, sh, ox, oy,
             )?;
-            self.last_id = Some(id);
-            self.last_element_name = Some(name.to_string());
-            self.last_state_name = Some(state_name.to_string());
-            Ok(format!("Element #{} created!", id))
+            (format!("Element #{} created!", id), id)
         };
 
-        match result {
-            Ok(msg) => {
-                place_image_at(temp_img, &dest)?;
-                self.refresh();
-                Ok(msg)
-            }
-            Err(e) => Err(e),
+        let placed = place_image_hold(temp_img, &dest)?;
+        if let Err(e) = tx.commit() {
+            placed.rollback();
+            return Err(e.to_string());
         }
+        placed.commit();
+
+        self.last_id = Some(new_id);
+        self.last_element_name = Some(name.to_string());
+        self.last_state_name = Some(state_name.to_string());
+        self.refresh();
+        Ok(msg)
     }
 
     fn begin_recapture(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -2308,6 +2568,124 @@ impl RecorderApp {
         self.forced_state_name = Some(state);
         self.begin_capture(ctx, frame, true);
         self.status = "重录：框选后将覆盖当前状态截图与坐标".into();
+    }
+
+    fn verify_layout(&self, e: &ElementRec) -> (i32, i32, i32, i32, i32, i32) {
+        let sw = self.sw as i32;
+        let sh = self.sh as i32;
+        let same_size = e.screen_w == sw && e.screen_h == sh;
+        let (mut bx, mut by, mut bw, mut bh, mut cx, mut cy) = if e.screen_w > 0
+            && e.screen_h > 0
+            && !same_size
+        {
+            (
+                matchutil::scale_i(e.bx, e.screen_w, sw),
+                matchutil::scale_i(e.by, e.screen_h, sh),
+                matchutil::scale_i(e.bw, e.screen_w, sw).max(1),
+                matchutil::scale_i(e.bh, e.screen_h, sh).max(1),
+                matchutil::scale_i(e.cx, e.screen_w, sw),
+                matchutil::scale_i(e.cy, e.screen_h, sh),
+            )
+        } else {
+            (e.bx, e.by, e.bw.max(1), e.bh.max(1), e.cx, e.cy)
+        };
+        // Rebase from the capture origin to the current virtual desktop.
+        if same_size {
+            let dx = e.origin_x - self.origin.0;
+            let dy = e.origin_y - self.origin.1;
+            bx += dx;
+            by += dy;
+            cx += dx;
+            cy += dy;
+        }
+        bx = bx.clamp(0, (sw - ROI_MIN_SIZE).max(0));
+        by = by.clamp(0, (sh - ROI_MIN_SIZE).max(0));
+        bw = bw.min(sw - bx).max(1);
+        bh = bh.min(sh - by).max(1);
+        cx = cx.clamp(0, (sw - 1).max(0));
+        cy = cy.clamp(0, (sh - 1).max(0));
+        (bx, by, bw, bh, cx, cy)
+    }
+
+    fn finish_verify(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        out: VerifyOutcome,
+    ) {
+        if out.generation != self.verify_gen {
+            return;
+        }
+        let Some(e) = self
+            .elements
+            .iter()
+            .find(|e| e.id == out.element_id)
+            .cloned()
+        else {
+            self.verify_rx = None;
+            self.exit_verify_match(ctx, frame);
+            self.status = "验配失败：元件不存在".into();
+            return;
+        };
+        let (bx, by, bw, bh, rec_cx, rec_cy) = self.verify_layout(&e);
+        let (score, has_hit, hit_x, hit_y, hit_cx, hit_cy, tw, th, used_roi) = match out.hit {
+            Some(h) => (
+                h.score,
+                h.score >= 0.55,
+                h.hit_x,
+                h.hit_y,
+                h.hit_cx,
+                h.hit_cy,
+                h.tw,
+                h.th,
+                h.used_roi,
+            ),
+            None => (
+                0.0,
+                false,
+                0,
+                0,
+                0,
+                0,
+                out.template_w,
+                out.template_h,
+                true,
+            ),
+        };
+        self.verify_rx = None;
+        self.mode = AppMode::VerifyMatch {
+            element_id: e.id,
+            score,
+            has_hit,
+            hit_x,
+            hit_y,
+            hit_cx,
+            hit_cy,
+            tw,
+            th,
+            bx,
+            by,
+            bw,
+            bh,
+            rec_cx,
+            rec_cy,
+            used_roi,
+        };
+        self.status = if has_hit {
+            let (ox, oy) = self.origin;
+            format!(
+                "验配 score={:.3} hit=({},{}) recorded=({},{}) {}",
+                score,
+                hit_cx + ox,
+                hit_cy + oy,
+                rec_cx + ox,
+                rec_cy + oy,
+                if used_roi { "ROI" } else { "全屏" }
+            )
+        } else {
+            "验配失败：未找到模板".into()
+        };
+        ctx.request_repaint();
     }
 
     fn begin_verify_match(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -2328,13 +2706,14 @@ impl RecorderApp {
             }
         };
 
-        self.status = "验配中：截屏并搜索…".into();
+        self.status = "验配中：截屏…".into();
         let excluded = set_exclude_from_capture(frame, true);
         if !excluded {
             let _ = park_window_offscreen(frame);
             thread::sleep(Duration::from_millis(60));
         }
-        let screen = match grab_primary_monitor() {
+        self.refresh_origin();
+        let screen = match grab_virtual_desktop() {
             Ok(img) => img,
             Err(err) => {
                 self.restore_main_window(ctx, frame);
@@ -2346,24 +2725,10 @@ impl RecorderApp {
         self.sh = screen.height();
         self.scale = ctx.pixels_per_point().max(0.1);
 
-        let (bx, by, bw, bh, rec_cx, rec_cy) = if e.screen_w > 0
-            && e.screen_h > 0
-            && (e.screen_w != self.sw as i32 || e.screen_h != self.sh as i32)
-        {
-            (
-                matchutil::scale_i(e.bx, e.screen_w, self.sw as i32),
-                matchutil::scale_i(e.by, e.screen_h, self.sh as i32),
-                matchutil::scale_i(e.bw, e.screen_w, self.sw as i32).max(1),
-                matchutil::scale_i(e.bh, e.screen_h, self.sh as i32).max(1),
-                matchutil::scale_i(e.cx, e.screen_w, self.sw as i32),
-                matchutil::scale_i(e.cy, e.screen_h, self.sh as i32),
-            )
-        } else {
-            (e.bx, e.by, e.bw.max(1), e.bh.max(1), e.cx, e.cy)
-        };
+        let (bx, by, bw, bh, _, _) = self.verify_layout(&e);
         let roi = Some((bx, by, bw, bh));
-        let hit = matchutil::find_template_smart(&screen, &template, roi, 0.85);
 
+        // Upload the frozen desktop before moving the pixels into the worker.
         let size = [screen.width() as usize, screen.height() as usize];
         let color_img = egui::ColorImage::from_rgba_unmultiplied(size, screen.as_raw());
         let tex = ctx.load_texture(
@@ -2371,71 +2736,37 @@ impl RecorderApp {
             color_img,
             egui::TextureOptions::NEAREST,
         );
-        self.pre_capture = Some((tex, screen));
+        self.verify_bg = Some(tex);
+        self.pre_capture = None;
         let _ = self.load_overlay_template(ctx, e.id);
 
-        let (score, has_hit, hit_x, hit_y, hit_cx, hit_cy, tw, th, used_roi) = match hit {
-            Some(h) if h.score >= 0.55 => (
-                h.score,
-                true,
-                h.hit_x,
-                h.hit_y,
-                h.hit_cx,
-                h.hit_cy,
-                h.tw,
-                h.th,
-                h.used_roi,
-            ),
-            Some(h) => (
-                h.score,
-                false,
-                h.hit_x,
-                h.hit_y,
-                h.hit_cx,
-                h.hit_cy,
-                h.tw,
-                h.th,
-                h.used_roi,
-            ),
-            None => (0.0, false, 0, 0, 0, 0, template.width() as i32, template.height() as i32, true),
-        };
+        let (tx, rx) = mpsc::channel();
+        self.verify_rx = Some(rx);
+        self.verify_gen = self.verify_gen.wrapping_add(1);
+        let generation = self.verify_gen;
+        let element_id = e.id;
+        let template_w = template.width() as i32;
+        let template_h = template.height() as i32;
+        thread::spawn(move || {
+            let hit = matchutil::find_template_smart(&screen, &template, roi, 0.85);
+            let _ = tx.send(VerifyOutcome {
+                element_id,
+                generation,
+                hit,
+                template_w,
+                template_h,
+            });
+        });
 
-        self.mode = AppMode::VerifyMatch {
-            element_id: e.id,
-            score,
-            has_hit,
-            hit_x,
-            hit_y,
-            hit_cx,
-            hit_cy,
-            tw,
-            th,
-            bx,
-            by,
-            bw,
-            bh,
-            rec_cx,
-            rec_cy,
-            used_roi,
+        self.mode = AppMode::VerifyingMatch {
+            started_at: std::time::Instant::now(),
         };
-        self.status = if has_hit {
-            format!(
-                "验配 score={:.3} hit=({},{}) recorded=({},{}) {}",
-                score,
-                hit_cx,
-                hit_cy,
-                rec_cx,
-                rec_cy,
-                if used_roi { "ROI" } else { "全屏" }
-            )
-        } else {
-            "验配失败：未找到模板".into()
-        };
+        self.status = "验配中：后台匹配…（Esc 取消）".into();
 
         let logical_w = self.sw as f32 / self.scale;
         let logical_h = self.sh as f32 / self.scale;
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.overlay_pos_logical()));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_w, logical_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2445,6 +2776,9 @@ impl RecorderApp {
     }
 
     fn exit_verify_match(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        self.verify_bg = None;
+        self.verify_rx = None;
+        self.verify_gen = self.verify_gen.wrapping_add(1);
         self.pre_capture = None;
         self.overlay_template = None;
         self.restore_main_window(ctx, frame);
@@ -2508,9 +2842,10 @@ impl RecorderApp {
 impl eframe::App for RecorderApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         match self.mode {
-            AppMode::Capturing | AppMode::EditRoi { .. } | AppMode::VerifyMatch { .. } => {
-                [0.0, 0.0, 0.0, 1.0]
-            }
+            AppMode::Capturing
+            | AppMode::EditRoi { .. }
+            | AppMode::VerifyMatch { .. }
+            | AppMode::VerifyingMatch { .. } => [0.0, 0.0, 0.0, 1.0],
             _ => {
                 let c = _visuals.panel_fill;
                 [
@@ -2528,13 +2863,83 @@ impl eframe::App for RecorderApp {
         match &self.mode {
             AppMode::Capturing => ctx.request_repaint(), // drain rdev promptly
             AppMode::EditRoi { drag: Some(_), .. } => ctx.request_repaint(),
-            AppMode::EditRoi { .. } | AppMode::VerifyMatch { .. } => {
+            AppMode::EditRoi { .. } | AppMode::VerifyMatch { .. } | AppMode::VerifyingMatch { .. } => {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
             _ => {}
         }
 
         match &self.mode {
+            AppMode::VerifyingMatch { .. } => {
+                let mut finished: Option<VerifyOutcome> = None;
+                let mut disconnected = false;
+                if let Some(rx) = &self.verify_rx {
+                    match rx.try_recv() {
+                        Ok(out) => finished = Some(out),
+                        Err(TryRecvError::Disconnected) => disconnected = true,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                }
+                if disconnected {
+                    self.verify_rx = None;
+                    self.exit_verify_match(ctx, frame);
+                    self.status = "验配失败：后台任务中断".into();
+                    return;
+                }
+                if let Some(out) = finished {
+                    self.finish_verify(ctx, frame, out);
+                    return;
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) || escape_key_down() {
+                    self.exit_verify_match(ctx, frame);
+                    self.status = "验配已取消".into();
+                    return;
+                }
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(Color32::BLACK))
+                    .show(ctx, |ui| {
+                        let painter = ui.painter();
+                        let s = self.scale.max(0.1);
+                        let sw = self.sw as f32 / s;
+                        let sh = self.sh as f32 / s;
+                        if let Some(tex) = self.bg_texture() {
+                            painter.image(
+                                tex.id(),
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(sw, sh)),
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        painter.rect_filled(
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(sw, sh)),
+                            0.0,
+                            Color32::from_black_alpha(140),
+                        );
+                        egui::Area::new(egui::Id::new("verifying_card"))
+                            .fixed_pos(Pos2::new(sw / 2.0 - 150.0, sh / 2.0 - 56.0))
+                            .order(egui::Order::Foreground)
+                            .show(ctx, |ui| {
+                                egui::Frame::none()
+                                    .fill(Color32::from_black_alpha(220))
+                                    .rounding(8.0)
+                                    .inner_margin(egui::Margin::same(16.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(280.0);
+                                        ui.label(
+                                            egui::RichText::new("验配中… 后台匹配")
+                                                .size(18.0)
+                                                .color(Color32::WHITE),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Esc 取消")
+                                                .color(Color32::LIGHT_GRAY),
+                                        );
+                                        ui.add(egui::Spinner::new());
+                                    });
+                            });
+                    });
+            }
             AppMode::VerifyMatch { .. } => {
                 let (
                     element_id,
@@ -2620,7 +3025,7 @@ impl eframe::App for RecorderApp {
                         let painter = ui.painter();
                         let sw = to_ui(self.sw as i32);
                         let sh = to_ui(self.sh as i32);
-                        if let Some((tex, _)) = &self.pre_capture {
+                        if let Some(tex) = self.bg_texture() {
                             let bg = Rect::from_min_max(Pos2::ZERO, Pos2::new(sw, sh));
                             painter.image(
                                 tex.id(),
@@ -2639,7 +3044,7 @@ impl eframe::App for RecorderApp {
                             0.0,
                             Color32::from_black_alpha(100),
                         );
-                        if let Some((tex, _)) = &self.pre_capture {
+                        if let Some(tex) = self.bg_texture() {
                             painter.image(
                                 tex.id(),
                                 roi_r,
@@ -2713,10 +3118,16 @@ impl eframe::App for RecorderApp {
                                         if has_hit {
                                             let dx = hit_cx - rec_cx;
                                             let dy = hit_cy - rec_cy;
+                                            let (ox, oy) = self.origin;
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "命中中心 ({}, {})  录制中心 ({}, {})  Δ=({}, {})",
-                                                    hit_cx, hit_cy, rec_cx, rec_cy, dx, dy
+                                                    "命中中心 ({}, {})  录制中心 ({}, {})  Δ=({}, {})  (屏幕坐标)",
+                                                    hit_cx + ox,
+                                                    hit_cy + oy,
+                                                    rec_cx + ox,
+                                                    rec_cy + oy,
+                                                    dx,
+                                                    dy
                                                 ))
                                                 .color(Color32::WHITE),
                                             );
@@ -3296,17 +3707,24 @@ impl eframe::App for RecorderApp {
                 while let Ok(msg) = self.rx.try_recv() {
                     match msg {
                         CaptureMsg::Down(x, y) => {
-                            self.drag_start = Some((x as i32, y as i32));
-                            self.drag_current = Some((x as i32, y as i32));
-                            self.status = format!("Drag started ({},{}), release to finish", x as i32, y as i32);
+                            let (ix, iy) = self.screen_to_image(x, y);
+                            self.drag_start = Some((ix, iy));
+                            self.drag_current = Some((ix, iy));
+                            self.status = format!(
+                                "Drag started ({},{}), release to finish",
+                                ix + self.origin.0,
+                                iy + self.origin.1
+                            );
                         }
                         CaptureMsg::Move(x, y) => {
-                            self.mouse_pos = Some((x as i32, y as i32));
+                            let (ix, iy) = self.screen_to_image(x, y);
+                            self.mouse_pos = Some((ix, iy));
                             if self.drag_start.is_some() {
-                                self.drag_current = Some((x as i32, y as i32));
+                                self.drag_current = Some((ix, iy));
                             }
                         }
                         CaptureMsg::Up(x, y) => {
+                            let (ix, iy) = self.screen_to_image(x, y);
                             log_error("capture up start");
                             let saved_start = self.drag_start.take();
                             let pre_img = self.pre_capture.take();
@@ -3318,13 +3736,10 @@ impl eframe::App for RecorderApp {
 
                             let result = match (saved_start, pre_img) {
                                 (Some((sx, sy)), Some((_tex, full))) => {
-                                    // rdev reports virtual-screen pixels, which can be
-                                    // negative or larger than the primary capture on a
-                                    // multi-monitor setup. Clamp in i64 BEFORE casting to
-                                    // u32: `(-10i32) as u32` would otherwise wrap to a
-                                    // huge value and silently crop the far edge.
+                                    // Both endpoints are image-relative now; clamp
+                                    // defensively in case the desktop changed mid-drag.
                                     match clamp_drag_to_image(
-                                        sx, sy, x as i32, y as i32, full.width(), full.height(),
+                                        sx, sy, ix, iy, full.width(), full.height(),
                                     ) {
                                         None => Err("Region outside captured screen".into()),
                                         Some((lpx, lpy, lpw, lph)) => {
@@ -3521,7 +3936,11 @@ impl eframe::App for RecorderApp {
                                 painter.line_segment([Pos2::new(0.0, my), Pos2::new(sw, my)], Stroke::new(1.0, cross_color));
                                 painter.line_segment([Pos2::new(mx, 0.0), Pos2::new(mx, sh)], Stroke::new(1.0, cross_color));
 
-                                let coord = format!(" ({}, {}) ", (mx * s) as i32, (my * s) as i32);
+                                let coord = format!(
+                                    " ({}, {}) ",
+                                    (mx * s) as i32 + self.origin.0,
+                                    (my * s) as i32 + self.origin.1
+                                );
                                 let tip_x = if mx + 80.0 < sw { mx + 12.0 } else { mx - 12.0 - coord.len() as f32 * 7.5 };
                                 let tip_y = if my + 28.0 < sh { my + 12.0 } else { my - 28.0 };
                                 let tip_bg = Rect::from_min_size(Pos2::new(tip_x, tip_y), egui::vec2(coord.len() as f32 * 7.5, 20.0));
@@ -3627,11 +4046,14 @@ impl eframe::App for RecorderApp {
                                     ),
                                 );
                                 if ui.button("缩放到当前屏").clicked() {
+                                    let (ox, oy) = self.origin;
                                     match rescale_element_geometry(
                                         &self.conn,
                                         &e,
                                         self.sw as i32,
                                         self.sh as i32,
+                                        ox,
+                                        oy,
                                     ) {
                                         Ok(()) => {
                                             self.refresh();
@@ -3988,7 +4410,15 @@ impl eframe::App for RecorderApp {
                                 ui.horizontal(|ui| {
                                     ui.vertical(|ui| {
                                         ui.set_min_width(360.0);
-                                        ui.label(format!("1. Center 中心点:  ({}, {})", e.cx, e.cy));
+                                        ui.label(format!(
+                                            "1. Center 中心点:  ({}, {})   origin=({}, {})   screen=({}, {})",
+                                            e.cx,
+                                            e.cy,
+                                            e.origin_x,
+                                            e.origin_y,
+                                            e.cx + e.origin_x,
+                                            e.cy + e.origin_y
+                                        ));
                                         ui.label(format!(
                                             "2. Image 图片区域:  {} x {} px    file: {}    (anchored to center)",
                                             iw,
@@ -4271,7 +4701,9 @@ fn main() -> eframe::Result {
     let db_path = cfg.db_path();
     let image_dir = cfg.image_dir();
     let conn = init_db(&db_path);
+    migrate_image_paths(&conn, &image_dir);
     let (sw, sh) = get_resolution();
+    let (origin_x, origin_y, _, _) = virtual_screen_rect();
     let elems = load_elements(&conn);
     let last = elems.last().map(|e| e.id);
     let flag = Arc::new(AtomicBool::new(false));
@@ -4295,6 +4727,7 @@ fn main() -> eframe::Result {
             last_state_name: None,
             is_add_state_mode: false,
             sw, sh,
+            origin: (origin_x, origin_y),
             scale: 1.0,
             mode: AppMode::Normal,
             input: String::new(),
@@ -4313,6 +4746,9 @@ fn main() -> eframe::Result {
             pre_capture: None,
             preview: None,
             overlay_template: None,
+            verify_bg: None,
+            verify_rx: None,
+            verify_gen: 0,
             health: std::collections::HashMap::new(),
             health_screen: (0, 0),
         };
@@ -4440,7 +4876,7 @@ mod tests {
         let dir = temp.to_string_lossy().to_string();
 
         let id = create_elem(
-            &conn, "old", "-n", 10, 10, 60, 40, "old_-n.png", 1920, 1080,
+            &conn, "old", "-n", 10, 10, 60, 40, "old_-n.png", 1920, 1080, 0, 0,
         )
         .unwrap();
         fs::write(temp.join("old_-n.png"), b"img").unwrap();
@@ -4462,14 +4898,122 @@ mod tests {
     }
 
     #[test]
+    fn db_image_path_keeps_group_subdirectories() {
+        let dir = std::env::temp_dir();
+        let base = dir.join("mr-base");
+        let dest = base.join("scene").join("foo_-n.png");
+        assert_eq!(
+            db_image_path(&base.to_string_lossy(), &dest.to_string_lossy()),
+            "scene/foo_-n.png"
+        );
+        assert_eq!(
+            db_image_path(&base.to_string_lossy(), r"D:\elsewhere\x.png"),
+            r"D:\elsewhere\x.png"
+        );
+    }
+
+    #[test]
+    fn migrate_image_paths_finds_group_files() {
+        let conn = init_db(":memory:");
+        let temp = std::env::temp_dir().join(format!("mr-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("scene")).unwrap();
+        fs::write(temp.join("scene").join("foo_-n.png"), b"img").unwrap();
+        create_elem(
+            &conn,
+            "scene/foo",
+            "-n",
+            10,
+            10,
+            60,
+            40,
+            "foo_-n.png",
+            1920,
+            1080,
+            0,
+            0,
+        )
+        .unwrap();
+        migrate_image_paths(&conn, &temp.to_string_lossy());
+        let els = load_elements(&conn);
+        assert_eq!(els[0].states[0].image_path, "scene/foo_-n.png");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn placed_image_rollback_restores_old_file() {
+        let dir = std::env::temp_dir().join(format!("mr-place-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("a_-n.png");
+        let temp = dir.join("capture.png");
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&temp, b"new").unwrap();
+
+        let placed = place_image_hold(
+            temp.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        placed.rollback();
+        assert_eq!(fs::read(&dest).unwrap(), b"old");
+        assert!(!dir.join("a_-n.png.bak").exists());
+
+        // A committed placement keeps the new bytes and drops the backup.
+        fs::write(&temp, b"newer").unwrap();
+        let placed = place_image_hold(
+            temp.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        )
+        .unwrap();
+        placed.commit();
+        assert_eq!(fs::read(&dest).unwrap(), b"newer");
+        assert!(!dir.join("a_-n.png.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_in_tx_rolls_back_on_drop() {
+        let conn = init_db(":memory:");
+        let tx = conn.unchecked_transaction().unwrap();
+        create_elem_in_tx(
+            &tx, "a", "-n", 10, 10, 60, 40, "a_-n.png", 1920, 1080, 0, 0,
+        )
+        .unwrap();
+        drop(tx); // no commit -> rollback
+        assert!(load_elements(&conn).is_empty());
+    }
+
+    #[test]
+    fn set_primary_is_atomic_on_missing_state() {
+        let conn = init_db(":memory:");
+        let id = create_elem(
+            &conn, "a", "-n", 10, 10, 60, 40, "a_-n.png", 1920, 1080, 0, 0,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO element_states(element_id,state_name,image_path,is_primary,created_at)
+             VALUES(?1,'-s','a_-s.png',0,'x')",
+            params![id],
+        )
+        .unwrap();
+
+        assert!(set_primary_state(&conn, id, "missing").is_err());
+        let els = load_elements(&conn);
+        assert!(els[0].find_state("-n").unwrap().is_primary);
+        assert!(!els[0].find_state("-s").unwrap().is_primary);
+    }
+
+    #[test]
     fn load_elements_groups_states_in_id_order() {
         let conn = init_db(":memory:");
         let id1 = create_elem(
-            &conn, "a", "-n", 10, 10, 60, 40, "a_-n.png", 1920, 1080,
+            &conn, "a", "-n", 10, 10, 60, 40, "a_-n.png", 1920, 1080, -1920, 0,
         )
         .unwrap();
         create_elem(
-            &conn, "b", "-n", 110, 110, 160, 140, "b_-n.png", 1920, 1080,
+            &conn, "b", "-n", 110, 110, 160, 140, "b_-n.png", 1920, 1080, -1920, 0,
         )
         .unwrap();
         conn.execute(
@@ -4485,6 +5029,8 @@ mod tests {
         assert_eq!(els[0].states[0].name, "-n");
         assert_eq!(els[0].states[1].name, "-s");
         assert!(els[0].states[0].is_primary);
+        assert_eq!(els[0].origin_x, -1920);
+        assert_eq!(els[0].origin_y, 0);
         assert_eq!(els[1].states.len(), 1);
     }
 }

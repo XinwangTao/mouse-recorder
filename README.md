@@ -104,15 +104,27 @@ The temporary `capture_<timestamp>.png` file is renamed automatically. If the re
 
 ## Coordinates
 
-Coordinates are in **physical pixels** — the raw values from the Windows low-level mouse hook multiplied by the DPI scale factor (`pixels_per_point`):
+Coordinates are in **physical pixels**. The app captures the whole Windows
+virtual desktop (all monitors), so the captured image is the desktop bounding
+box:
 
-```
-physical_x = logical_x × dpi_scale
-```
+- Geometry (`center`, `ROI`, image rect) is stored **relative to the captured
+  image**, starting at `(0, 0)`.
+- `origin_x` / `origin_y` record where that image starts in Windows
+  virtual-screen coordinates (negative when a monitor sits left of/above the
+  primary).
+- To get a mouse-click coordinate: `screen_x = center_x + origin_x`.
 
-So on a 125% DPI display, a logical position of `(800, 600)` is stored as `(1000, 750)`.
+Exports (CSV, `db_manager.py`) already add the origin, so their `x` / `y` are
+virtual-screen pixels usable for `SetCursorPos` / automation tools.
 
-The `screen_width` / `screen_height` stored per element lets consumers rescale coordinates when replaying on a different resolution.
+`screen_width` / `screen_height` store the virtual desktop size at capture time;
+consumers can rescale when replaying on a different resolution.
+
+> Mixed-DPI monitor layouts: the overlay uses one DPI scale for the whole
+> virtual desktop. Recording on layouts whose monitors use different scaling
+> factors may be off by the per-monitor DPI difference; same-scale layouts are
+> exact. Re-record after changing the monitor arrangement.
 
 ---
 
@@ -123,12 +135,14 @@ Click **Export CSV**, enter a filename. Saved under `data/<filename>_<timestamp>
 | Column | Description |
 |--------|-------------|
 | `id` | Element ID |
-| `x` | Center X (physical pixels) |
-| `y` | Center Y (physical pixels) |
+| `x` | Center X (virtual-screen physical pixels = stored center + origin) |
+| `y` | Center Y (virtual-screen physical pixels) |
 | `description` | Element name |
 | `template_path` | Path to primary state screenshot |
-| `original_width` | Screen width at capture time |
-| `original_height` | Screen height at capture time |
+| `original_width` | Virtual desktop width at capture time |
+| `original_height` | Virtual desktop height at capture time |
+| `origin_x` | Image origin X in virtual-screen pixels |
+| `origin_y` | Image origin Y in virtual-screen pixels |
 
 ---
 
@@ -178,6 +192,8 @@ CREATE TABLE elements (
     bbox_height  INTEGER NOT NULL,
     screen_width  INTEGER NOT NULL,
     screen_height INTEGER NOT NULL,
+    origin_x     INTEGER NOT NULL DEFAULT 0,
+    origin_y     INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT    NOT NULL
 );
 
@@ -191,7 +207,7 @@ CREATE TABLE element_states (
 );
 ```
 
-Each element has exactly one primary state (`is_primary = 1`). This state is used in CSV exports.
+Each element has exactly one primary state (`is_primary = 1`). This state is used in CSV exports. `image_path` is relative to the image directory (for example `scene/foo_-n.png`); legacy basename-only rows are migrated to the relative form at startup when the file is found in a subdirectory.
 
 ---
 

@@ -18,8 +18,12 @@ IMAGE_DIR = ROOT_DIR / "data"
 
 def resolve_image_path(image_path: str) -> Path:
     p = Path(image_path)
-    if p.is_file():
+    if p.is_absolute() and p.is_file():
         return p
+    if not p.is_absolute():
+        cand = IMAGE_DIR / p
+        if cand.is_file():
+            return cand
     cand = IMAGE_DIR / p.name
     if cand.is_file():
         return cand
@@ -101,9 +105,15 @@ def export_validated(output_path):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cols = {r[1] for r in cursor.execute("PRAGMA table_info(elements)").fetchall()}
+    origin_select = (
+        "e.origin_x, e.origin_y"
+        if {"origin_x", "origin_y"} <= cols
+        else "0 AS origin_x, 0 AS origin_y"
+    )
+    cursor.execute(f"""
         SELECT e.id, e.name, e.center_x, e.center_y, es.image_path,
-               e.screen_width, e.screen_height
+               e.screen_width, e.screen_height, {origin_select}
         FROM elements e
         JOIN element_states es ON e.id = es.element_id AND es.is_primary = 1
         ORDER BY e.id
@@ -113,13 +123,15 @@ def export_validated(output_path):
     conn.close()
 
     with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
-        f.write("id,x,y,description,template_path,original_width,original_height\n")
+        f.write("id,x,y,description,template_path,original_width,original_height,origin_x,origin_y\n")
         for row in rows:
-            elem_id, name, center_x, center_y, image_path, sw, sh = row
+            elem_id, name, center_x, center_y, image_path, sw, sh, ox, oy = row
+            ox = ox or 0
+            oy = oy or 0
             full = str(resolve_image_path(image_path))
             escaped_name = name.replace('"', '""')
             escaped_path = full.replace('"', '""')
-            f.write(f'{elem_id},{center_x},{center_y},"{escaped_name}","{escaped_path}",{sw},{sh}\n')
+            f.write(f'{elem_id},{center_x + ox},{center_y + oy},"{escaped_name}","{escaped_path}",{sw},{sh},{ox},{oy}\n')
 
     print(f"[OK] Exported {len(rows)} element(s) to: {output_path}")
     return True

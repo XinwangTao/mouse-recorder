@@ -57,6 +57,9 @@ def resolve_png(raw: str, search_dirs: list[Path]) -> Path | None:
         return p
     name = p.name
     for d in search_dirs:
+        rel = d / p
+        if rel.exists():
+            return rel
         cand = d / name
         if cand.exists():
             return cand

@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Mouse Recorder · 采集 / 提交 / 验配",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/archify/mouse-recorder-next_workflow.html"
+  },
+  "lanes": [
+    { "id": "ui", "label": "操作界面" },
+    { "id": "capture", "label": "采集与坐标" },
+    { "id": "store", "label": "事务与文件" },
+    { "id": "verify", "label": "验配 / 失败出口", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "intake", "label": "发起", "fromCol": 0, "toCol": 1 },
+    { "id": "capture", "label": "截图 / 框选", "fromCol": 2, "toCol": 2, "variant": "emphasis" },
+    { "id": "commit", "label": "写入 / 提交", "fromCol": 3, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["req", "grab", "select", "db", "img", "ok"],
+  "nodes": [
+    { "id": "req", "lane": "ui", "col": 0, "type": "frontend", "label": "录制请求", "sublabel": "F5 / F6 / F12", "width": 136 },
+    { "id": "grab", "lane": "capture", "col": 1, "type": "backend", "label": "虚拟桌面截图", "sublabel": "origin + 全屏", "tag": "所有显示器", "width": 140 },
+    { "id": "select", "lane": "capture", "col": 2, "type": "frontend", "label": "框选区域", "sublabel": "屏幕坐标 → 图像坐标", "width": 140 },
+    { "id": "db", "lane": "store", "col": 3, "type": "database", "label": "DB 事务写入", "sublabel": "几何 + 相对路径", "tag": "旧路径启动迁移", "width": 146 },
+    { "id": "img", "lane": "store", "col": 4, "type": "backend", "label": "图片占位", "sublabel": "保留旧图 .bak", "width": 136 },
+    { "id": "ok", "lane": "store", "col": 5, "type": "database", "label": "提交", "sublabel": "commit + 删备份", "width": 132 },
+    { "id": "vprog", "lane": "verify", "col": 1, "type": "frontend", "label": "验配覆盖层", "sublabel": "F11 · Esc 取消", "width": 140 },
+    { "id": "vwork", "lane": "verify", "col": 2, "type": "messagebus", "label": "后台模板匹配", "sublabel": "截图 + 早停 SAD", "tag": "不阻塞 UI", "width": 140 },
+    { "id": "vres", "lane": "verify", "col": 3, "type": "frontend", "label": "命中结果", "sublabel": "青框 / 黄点", "width": 136 },
+    { "id": "fail", "lane": "verify", "col": 4, "type": "security", "label": "失败回滚", "sublabel": "DB 回滚 + 恢复旧图", "width": 146 }
+  ],
+  "edges": [
+    { "id": "req-grab", "from": "req", "to": "grab", "label": "发起采集", "variant": "emphasis" },
+    { "id": "grab-select", "from": "grab", "to": "select", "label": "桌面纹理", "variant": "default" },
+    { "id": "select-db", "from": "select", "to": "db", "label": "名称 + 状态", "variant": "default" },
+    { "id": "db-img", "from": "db", "to": "img", "label": "写入计划路径", "variant": "emphasis" },
+    { "id": "img-ok", "from": "img", "to": "ok", "label": "落图成功", "variant": "emphasis" },
+    { "id": "db-fail", "from": "db", "to": "fail", "label": "事务失败", "variant": "security", "role": "error" },
+    { "id": "img-fail", "from": "img", "to": "fail", "label": "落图 / 提交失败", "variant": "security", "role": "error" },
+    { "id": "vprog-work", "from": "vprog", "to": "vwork", "label": "启动线程", "variant": "dashed", "role": "async" },
+    { "id": "vwork-res", "from": "vwork", "to": "vres", "label": "MatchHit", "variant": "emphasis", "role": "return" }
+  ]
+}

@@ -30,3 +30,6 @@ Desktop.ini
 
 # Codegraph local index
 .codegraph/
+
+# Archify visual-check screenshots/receipts (keep the HTML + sidecar JSON)
+docs/archify/*.visual-check.*

@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] — 2026-11-06
+
+### Added
+- Multi-monitor capture: grabs the whole virtual desktop, records the capture
+  origin, converts rdev screen coordinates at the capture boundary, and exposes
+  `origin_x` / `origin_y` in the DB, CSV, and Python exports.
+- Grouped element names (`scene/foo`) now store image paths relative to the
+  image directory (`scene/foo_-n.png`). Startup migrates legacy basename rows
+  whose file lives in a subdirectory.
+- Async verify: the screenshot stays on the UI thread and template matching runs
+  in a worker thread, with a progress overlay, Esc cancel, and a generation
+  guard that ignores stale results.
+
+### Changed
+- Capture commits are two-phase: the DB transaction is held open while the PNG
+  is staged with its old version in `.bak`; DB commits first, then the backup is
+  dropped. A failure rolls back the side that already moved.
+- Edit/save and verify rebase recorded coordinates from the capture origin to
+  the current virtual desktop.
+
+### Fixed
+- `save_edit_roi` now records the current full-desktop origin with the geometry.
+
 ## [0.5.2] — 2026-11-06
 
 ### Fixed

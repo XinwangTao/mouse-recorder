@@ -23,14 +23,26 @@ IMAGE_DIR = ROOT_DIR / "data"
 
 
 def resolve_image_path(image_path: str) -> Path:
-    """Resolve DB image_path (basename or absolute legacy path) to a real file."""
+    """Resolve DB image_path (relative subpath, basename, or absolute) to a file."""
     p = Path(image_path)
-    if p.is_file():
+    if p.is_absolute() and p.is_file():
         return p
+    if not p.is_absolute():
+        cand = IMAGE_DIR / p
+        if cand.is_file():
+            return cand
     cand = IMAGE_DIR / p.name
     if cand.is_file():
         return cand
     return p
+
+
+def _origin_select(conn) -> str:
+    """Select origin columns when the DB has been migrated, else zeroes."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(elements)").fetchall()}
+    if {"origin_x", "origin_y"} <= cols:
+        return "e.origin_x, e.origin_y"
+    return "0 AS origin_x, 0 AS origin_y"
 
 
 class ElementDatabase:
@@ -135,12 +147,13 @@ class ElementDatabase:
     
     def export_to_clicker(self, output_path: str, element_ids: Optional[List[int]] = None):
         cursor = self.conn.cursor()
-        
+        origin_select = _origin_select(self.conn)
+
         if element_ids:
             placeholders = ','.join('?' * len(element_ids))
             query = f"""
                 SELECT e.id, e.name, e.center_x, e.center_y, es.image_path,
-                       e.screen_width, e.screen_height
+                       e.screen_width, e.screen_height, {origin_select}
                 FROM elements e
                 JOIN element_states es ON e.id = es.element_id AND es.is_primary = 1
                 WHERE e.id IN ({placeholders})
@@ -148,9 +161,9 @@ class ElementDatabase:
             """
             cursor.execute(query, element_ids)
         else:
-            query = """
+            query = f"""
                 SELECT e.id, e.name, e.center_x, e.center_y, es.image_path,
-                       e.screen_width, e.screen_height
+                       e.screen_width, e.screen_height, {origin_select}
                 FROM elements e
                 JOIN element_states es ON e.id = es.element_id AND es.is_primary = 1
                 ORDER BY e.id
@@ -160,12 +173,15 @@ class ElementDatabase:
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['id', 'x', 'y', 'description', 'template_path',
-                             'original_width', 'original_height'])
-            
+                             'original_width', 'original_height', 'origin_x', 'origin_y'])
+
             for row in cursor.fetchall():
-                elem_id, name, center_x, center_y, image_path, sw, sh = row
+                elem_id, name, center_x, center_y, image_path, sw, sh, ox, oy = row
+                ox = ox or 0
+                oy = oy or 0
                 full = str(resolve_image_path(image_path))
-                writer.writerow([elem_id, center_x, center_y, name, full, sw, sh])
+                # x/y are virtual-screen pixels (image center + capture origin).
+                writer.writerow([elem_id, center_x + ox, center_y + oy, name, full, sw, sh, ox, oy])
         
         return output_path
     
@@ -175,7 +191,13 @@ class ElementDatabase:
         if not include_all_states:
             for elem in elements:
                 elem['states'] = [s for s in elem['states'] if s['is_primary']]
-        
+
+        for elem in elements:
+            ox = elem.get('origin_x') or 0
+            oy = elem.get('origin_y') or 0
+            elem['screen_center_x'] = elem['center_x'] + ox
+            elem['screen_center_y'] = elem['center_y'] + oy
+
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(elements, f, indent=2, ensure_ascii=False)
         
