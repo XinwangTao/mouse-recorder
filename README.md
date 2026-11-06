@@ -30,6 +30,69 @@ python scripts/manage.py record
 
 ---
 
+## CLI / UI Automation (`--cli`)
+
+The same executable runs headless commands for scripts and agents:
+
+```
+mouse-recorder.exe --cli <command> [options]
+```
+
+| Command | What it does |
+|---------|--------------|
+| `list [--filter X] [--json]` | List elements and states |
+| `get <name> [--state S] [--json]` | Show one element |
+| `record --name NAME --rect x,y,w,h [--state S] [--overwrite]` | Capture a region without the GUI |
+| `find --element NAME[:STATE]` / `--template PATH` | Template search on the current screen |
+| `verify ...` | Same match, exit 3 when the score is below threshold |
+| `click --element NAME[:STATE]` / `--template PATH` / `--uia` / `--coords x,y` | Click a target; `--verify` re-checks afterwards |
+| `uia --window TITLE [--name X] [--automation-id X] [--class X] [--control-type X]` | Dump/filter Windows UIA controls with screen rects |
+| `ocr --text TEXT [--image PATH] [--lang eng]` | OCR text lookup (local Tesseract) |
+| `run workflow.json\|yaml [--json]` | Execute a click workflow |
+
+All geometry uses the same image-relative + `origin` model as the GUI; the CLI
+converts to virtual-screen coordinates before moving the mouse. `--rect`,
+`--coords` and `--roi` are always **virtual-screen** pixels.
+
+### Workflow format (JSON or YAML, schema_version 1)
+
+```yaml
+schema_version: 1
+name: login
+defaults:
+  threshold: 0.85
+  retry: 2
+steps:
+  - id: open
+    action: click
+    target:
+      type: element          # element | template | uia | ocr | coords
+      name: scene/login_btn
+    expect:
+      type: window           # none | window | element | template | ocr
+      window: "登录"
+  - id: submit
+    action: click
+    target:
+      type: uia
+      window: "登录"
+      control_type: Button
+      name: "确定"
+    expect:
+      type: none
+```
+
+Each step writes a screenshot, score, elapsed time and error to
+`runs/<timestamp>/report.json`; exit code 4 means an assertion failed. Adaptive
+thresholds (0.50–0.98) are stored in `runs/thresholds.json` and adjust only
+after consecutive evidence.
+
+OCR uses the locally installed Tesseract; available languages depend on its
+`tessdata` (this machine has `eng`). UIA covers standard Win32/WPF/UWP
+controls; canvas/game UIs fall back to template or OCR.
+
+---
+
 ## Recording Elements
 
 ### New element — F5

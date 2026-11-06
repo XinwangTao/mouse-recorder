@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.0] — 2026-11-06
+
+### Added
+- `mouse-recorder.exe --cli <command>`: headless element management and UI
+  automation, sharing the GUI database and image directory.
+  - `list`, `get`, `record` (non-interactive), `find`, `verify`, `click`
+  - `uia` target discovery (control name, automation id, class, type, rect)
+  - `ocr` text lookup via the locally installed Tesseract
+  - `run workflow.json|yaml` with click/type/key/wait/assert steps
+- JSON and YAML workflows share one schema (schema_version 1).
+- Every step writes a screenshot, score, elapsed time and error to
+  `runs/<timestamp>/report.json`; exit code 4 on assertion failure.
+- Adaptive template thresholds (0.50–0.98) based on consecutive evidence,
+  stored in `runs/thresholds.json`.
+- `--json` output for all commands; CLI attaches to the parent console.
+
+### Notes
+- OCR languages depend on installed Tesseract `tessdata` (this machine has
+  `eng`; Chinese OCR needs a `chi_sim` language pack or Windows OCR later).
+- UIA works for standard Win32/WPF/UWP controls; canvas/game UIs fall back to
+  template/OCR.
+- Recorded screen coordinates remain image-relative + origin; CLI converts to
+  virtual-screen coordinates before input.
+
 ## [0.6.2] — 2026-11-06
 
 ### Fixed

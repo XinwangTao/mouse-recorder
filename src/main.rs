@@ -2,6 +2,7 @@
 // the harness can print results.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod cli;
 mod matchutil;
 
 use chrono::Local;
@@ -4912,6 +4913,11 @@ impl eframe::App for RecorderApp {
 }
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--cli") {
+        cli::attach_console();
+        std::process::exit(cli::run(args[pos + 1..].to_vec()));
+    }
     setup_panic_hook();
     let cfg = Config::load();
     let db_path = cfg.db_path();

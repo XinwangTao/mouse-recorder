@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "name": "example-login",
+  "defaults": { "threshold": 0.85, "retry": 2 },
+  "steps": [
+    {
+      "id": "username",
+      "action": "click",
+      "target": { "type": "element", "name": "login/username" },
+      "expect": { "type": "none" }
+    },
+    { "id": "type-user", "action": "type", "text": "operator" },
+    {
+      "id": "submit",
+      "action": "click",
+      "target": { "type": "uia", "window": "登录", "control_type": "Button", "name": "确定" },
+      "expect": { "type": "window", "window": "主界面" }
+    }
+  ]
+}
