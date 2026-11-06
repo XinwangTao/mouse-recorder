@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.1] — 2026-11-06
+
+### Fixed
+- Edit/save refuses to write geometry when the recorded virtual-desktop size
+  differs from the current one, and the overlay tells you to rescale first.
+  Previously this could overwrite coordinates with unscaled values.
+- Startup crash recovery: a missing PNG is restored from its `.png.bak`; when
+  both exist the backup is kept for manual inspection.
+- Legacy path migration no longer guesses when two groups share a basename.
+- Verify cancel now cooperatively stops the matcher at the next row instead of
+  leaving a CPU-burning orphan worker.
+- Element/state names are validated: no `..`, absolute paths, backslashes,
+  drive/ADS colons, or Windows-invalid characters; one `group/name` level is
+  allowed.
+- Airtest helper resolves relative image paths and prefers screen coordinates.
+
 ## [0.6.0] — 2026-11-06
 
 ### Added

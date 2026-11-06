@@ -16,6 +16,11 @@ from airtest.core.api import *
 # mouse-recorder 生成的 JSON 文件路径（改成你的导出文件）
 RECORDS_FILE = "data/export_elements.json"
 
+# mouse-recorder 的图片目录（DB 里存的是相对路径）
+DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+)
+
 # 是否启用分辨率自动缩放
 AUTO_SCALE = True
 
@@ -39,6 +44,22 @@ def load_records(json_path):
     return records
 
 
+def resolve_image_path(image_path):
+    """DB 里可能是相对路径（如 scene/foo_-n.png）或旧 basename。"""
+    if not image_path:
+        return image_path
+    if os.path.isabs(image_path) and os.path.exists(image_path):
+        return image_path
+    if not os.path.isabs(image_path):
+        cand = os.path.join(DATA_DIR, image_path)
+        if os.path.exists(cand):
+            return cand
+    cand = os.path.join(DATA_DIR, os.path.basename(image_path))
+    if os.path.exists(cand):
+        return cand
+    return image_path
+
+
 def get_current_resolution():
     """获取当前设备分辨率"""
     try:
@@ -50,8 +71,9 @@ def get_current_resolution():
 
 def calculate_scale_factors(record, current_width, current_height):
     """计算分辨率缩放因子"""
-    original_width = record['screen_resolution']['width']
-    original_height = record['screen_resolution']['height']
+    screen = record.get('screen_resolution') or {}
+    original_width = screen.get('width', record.get('screen_width', 1920))
+    original_height = screen.get('height', record.get('screen_height', 1080))
     
     scale_x = current_width / original_width
     scale_y = current_height / original_height
@@ -76,17 +98,14 @@ def scale_bbox(bbox, scale_x, scale_y):
 
 def click_by_image(record, scale_x=1.0, scale_y=1.0, threshold=0.8):
     """通过图像识别点击"""
-    image_path = record['image_path']
-    
+    image_path = resolve_image_path(record['image_path'])
+
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"找不到图像文件: {image_path}")
-    
-    scaled_x, scaled_y = scale_point(
-        record['center_x'], 
-        record['center_y'], 
-        scale_x, 
-        scale_y
-    )
+
+    cx = record.get('screen_center_x', record.get('center_x'))
+    cy = record.get('screen_center_y', record.get('center_y'))
+    scaled_x, scaled_y = scale_point(cx, cy, scale_x, scale_y)
     
     try:
         template = Template(image_path, threshold=threshold, record_pos=[scaled_x, scaled_y])
@@ -103,12 +122,9 @@ def click_by_image(record, scale_x=1.0, scale_y=1.0, threshold=0.8):
 
 def click_by_coordinate(record, scale_x=1.0, scale_y=1.0):
     """通过坐标直接点击"""
-    scaled_x, scaled_y = scale_point(
-        record['center_x'], 
-        record['center_y'], 
-        scale_x, 
-        scale_y
-    )
+    cx = record.get('screen_center_x', record.get('center_x'))
+    cy = record.get('screen_center_y', record.get('center_y'))
+    scaled_x, scaled_y = scale_point(cx, cy, scale_x, scale_y)
     
     try:
         touch([scaled_x, scaled_y])
@@ -170,8 +186,10 @@ def execute_automation(records_file, auto_scale=True, recognition_threshold=0.8,
     print(f"✓ 当前分辨率: {current_width}x{current_height}")
     
     if records:
-        original_width = records[0]['screen_resolution']['width']
-        original_height = records[0]['screen_resolution']['height']
+        first = records[0]
+        screen = first.get('screen_resolution') or {}
+        original_width = screen.get('width', first.get('screen_width', 1920))
+        original_height = screen.get('height', first.get('screen_height', 1080))
         print(f"✓ 录制分辨率: {original_width}x{original_height}")
         
         if auto_scale:

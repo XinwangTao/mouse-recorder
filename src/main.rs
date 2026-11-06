@@ -177,6 +177,61 @@ fn get_next_state_suffix(current: &str) -> String {
     "-n".to_string()
 }
 
+const INVALID_NAME_CHARS: &[char] = &['\\', ':', '*', '?', '"', '<', '>', '|'];
+
+fn validate_file_component(part: &str) -> Result<(), String> {
+    if part.is_empty() {
+        return Err("名称段不能为空".into());
+    }
+    if part == "." || part == ".." {
+        return Err("名称不能是 . 或 ..".into());
+    }
+    if part.chars().any(|c| c.is_control()) {
+        return Err("名称不能包含控制字符".into());
+    }
+    if let Some(c) = part.chars().find(|c| INVALID_NAME_CHARS.contains(c)) {
+        return Err(format!("名称不能包含字符 {c}"));
+    }
+    if part.ends_with(' ') || part.ends_with('.') {
+        return Err("名称段不能以空格或点结尾".into());
+    }
+    Ok(())
+}
+
+/// Element names may use one level of `group/name`; reject path escapes and
+/// Windows-invalid filename characters before they reach the filesystem.
+fn validate_element_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("名称不能为空".into());
+    }
+    if name.chars().count() > 120 {
+        return Err("名称过长（最多 120 字符）".into());
+    }
+    let parts: Vec<&str> = name.split('/').collect();
+    if parts.len() > 2 {
+        return Err("最多一层分组（group/name）".into());
+    }
+    for p in &parts {
+        validate_file_component(p)?;
+    }
+    Ok(())
+}
+
+fn validate_state_name(state: &str) -> Result<(), String> {
+    let state = state.trim();
+    if state.is_empty() {
+        return Err("状态名不能为空".into());
+    }
+    if state.contains('/') {
+        return Err("状态名不能包含 /".into());
+    }
+    if state.chars().count() > 60 {
+        return Err("状态名过长（最多 60 字符）".into());
+    }
+    validate_file_component(state)
+}
+
 /// Bounding box of all monitors in virtual-screen coordinates. The origin can
 /// be negative when a monitor sits left/above the primary.
 #[cfg(windows)]
@@ -807,9 +862,7 @@ fn rename_element(
     new_name: &str,
 ) -> Result<(), String> {
     let new_name = new_name.trim();
-    if new_name.is_empty() {
-        return Err("名称不能为空".into());
-    }
+    validate_element_name(new_name)?;
     if new_name == old_name {
         return Ok(());
     }
@@ -1266,7 +1319,7 @@ fn collect_png_paths(
     dir: &std::path::Path,
     base: &std::path::Path,
     depth: usize,
-    out: &mut std::collections::HashMap<String, String>,
+    out: &mut std::collections::HashMap<String, Option<String>>,
 ) {
     if depth > 4 {
         return;
@@ -1288,16 +1341,88 @@ fn collect_png_paths(
                 p.file_name().and_then(|n| n.to_str()),
                 p.strip_prefix(base),
             ) {
-                out.entry(name.to_string())
-                    .or_insert_with(|| rel.to_string_lossy().replace('\\', "/"));
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                match out.entry(name.to_string()) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(Some(rel));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        // Two groups share a basename: do not guess.
+                        if e.get().as_deref() != Some(rel.as_str()) {
+                            e.insert(None);
+                        }
+                    }
+                }
             }
         }
     }
 }
 
+fn collect_bak_paths(
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_bak_paths(&p, depth + 1, out);
+        } else if p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase().ends_with(".png.bak"))
+            .unwrap_or(false)
+        {
+            out.push(p);
+        }
+    }
+}
+
+/// A crash between "old PNG moved to .bak" and "DB committed" can leave the
+/// destination missing. Restore it. When both exist, keep the backup: the DB
+/// may have rolled back and the next capture of the same name will rotate it.
+fn recover_image_backups(image_dir: &str) {
+    let base = std::path::Path::new(image_dir);
+    let mut baks = Vec::new();
+    collect_bak_paths(base, 0, &mut baks);
+    let mut restored = 0usize;
+    let mut stale = 0usize;
+    for bak in baks {
+        let Some(name) = bak.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(dest_name) = name.strip_suffix(".bak") else {
+            continue;
+        };
+        let dest = bak.with_file_name(dest_name);
+        if dest.exists() {
+            stale += 1;
+            continue;
+        }
+        match fs::rename(&bak, &dest) {
+            Ok(()) => restored += 1,
+            Err(e) => log_error(&format!("restore {}: {e}", bak.display())),
+        }
+    }
+    if restored > 0 {
+        log_error(&format!("restored {restored} image(s) from .bak"));
+    }
+    if stale > 0 {
+        log_error(&format!(
+            "{stale} stale .png.bak file(s) kept for manual check"
+        ));
+    }
+}
+
 /// Legacy rows stored only the basename while the file actually lives in a
 /// group subdirectory. Point them at the relative path when the basename is
-/// ambiguous/missing at the root.
+/// unique; ambiguous basenames are left untouched.
 fn migrate_image_paths(conn: &Connection, image_dir: &str) {
     let base = std::path::Path::new(image_dir);
     let mut rows: Vec<(i64, String)> = Vec::new();
@@ -1323,7 +1448,7 @@ fn migrate_image_paths(conn: &Connection, image_dir: &str) {
         else {
             continue;
         };
-        if let Some(rel) = index.get(name) {
+        if let Some(Some(rel)) = index.get(name) {
             if conn
                 .execute(
                     "UPDATE element_states SET image_path=?1 WHERE id=?2",
@@ -1664,6 +1789,8 @@ struct RecorderApp {
     verify_bg: Option<egui::TextureHandle>,
     /// Result channel from the background matcher.
     verify_rx: Option<mpsc::Receiver<VerifyOutcome>>,
+    /// Cooperative cancellation for the matcher worker.
+    verify_cancel: Option<Arc<AtomicBool>>,
     /// Invalidates late results after cancel / a newer verify.
     verify_gen: u64,
     /// Cached health badges per element id; rebuilt on refresh / screen change.
@@ -2078,9 +2205,13 @@ impl RecorderApp {
     ) -> (i32, i32, i32, i32, i32, i32) {
         let screen_w = self.sw as i32;
         let screen_h = self.sh as i32;
-        // Rebase from the capture origin to the current virtual desktop.
-        let dx = e.origin_x - self.origin.0;
-        let dy = e.origin_y - self.origin.1;
+        // Rebase from the capture origin only when the desktop size is
+        // unchanged; on a resolution change the caller must rescale first.
+        let (dx, dy) = if e.screen_w == screen_w && e.screen_h == screen_h {
+            (e.origin_x - self.origin.0, e.origin_y - self.origin.1)
+        } else {
+            (0, 0)
+        };
         let cx = e.cx + dx;
         let cy = e.cy + dy;
         let (ix, iy, iw, ih) =
@@ -2162,6 +2293,14 @@ impl RecorderApp {
                 e.name, idx, n, st
             )
         };
+        if editable
+            && e.screen_w > 0
+            && e.screen_h > 0
+            && (e.screen_w != self.sw as i32 || e.screen_h != self.sh as i32)
+        {
+            self.status =
+                "分辨率不一致：请先 Esc，点「缩放到当前屏」后再编辑保存".into();
+        }
         ctx.request_repaint();
     }
 
@@ -2305,6 +2444,17 @@ impl RecorderApp {
             }
             _ => return,
         };
+        // Saving unscaled coordinates with a new screen size would corrupt the
+        // element; require an explicit rescale first.
+        if let Some(rec) = self.elements.iter().find(|e| e.id == id) {
+            if rec.screen_w > 0
+                && rec.screen_h > 0
+                && (rec.screen_w != self.sw as i32 || rec.screen_h != self.sh as i32)
+            {
+                self.status = "分辨率不一致：请先点「缩放到当前屏」再保存".into();
+                return;
+            }
+        }
         let (ox, oy) = self.origin;
         match update_element_geometry(
             &self.conn,
@@ -2491,6 +2641,15 @@ impl RecorderApp {
         is_add_state: bool,
         overwrite: bool,
     ) -> Result<String, String> {
+        // Only new element names are validated; legacy existing names must remain
+        // re-recordable/overwritable.
+        let existing_name = is_add_state
+            || existing_id.is_some()
+            || find_element_id_by_name(&self.conn, name).is_some();
+        if !existing_name {
+            validate_element_name(name)?;
+        }
+        validate_state_name(state_name)?;
         let dest = std::path::Path::new(&self.image_dir)
             .join(format!("{}_{}.png", name, state_name))
             .to_string_lossy()
@@ -2653,6 +2812,7 @@ impl RecorderApp {
             ),
         };
         self.verify_rx = None;
+        self.verify_cancel = None;
         self.mode = AppMode::VerifyMatch {
             element_id: e.id,
             score,
@@ -2740,6 +2900,11 @@ impl RecorderApp {
         self.pre_capture = None;
         let _ = self.load_overlay_template(ctx, e.id);
 
+        if let Some(old) = self.verify_cancel.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.verify_cancel = Some(Arc::clone(&cancel));
         let (tx, rx) = mpsc::channel();
         self.verify_rx = Some(rx);
         self.verify_gen = self.verify_gen.wrapping_add(1);
@@ -2748,7 +2913,13 @@ impl RecorderApp {
         let template_w = template.width() as i32;
         let template_h = template.height() as i32;
         thread::spawn(move || {
-            let hit = matchutil::find_template_smart(&screen, &template, roi, 0.85);
+            let hit = matchutil::find_template_smart_cancellable(
+                &screen,
+                &template,
+                roi,
+                0.85,
+                &cancel,
+            );
             let _ = tx.send(VerifyOutcome {
                 element_id,
                 generation,
@@ -2778,6 +2949,9 @@ impl RecorderApp {
     fn exit_verify_match(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         self.verify_bg = None;
         self.verify_rx = None;
+        if let Some(c) = self.verify_cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
         self.verify_gen = self.verify_gen.wrapping_add(1);
         self.pre_capture = None;
         self.overlay_template = None;
@@ -4701,6 +4875,7 @@ fn main() -> eframe::Result {
     let db_path = cfg.db_path();
     let image_dir = cfg.image_dir();
     let conn = init_db(&db_path);
+    recover_image_backups(&image_dir);
     migrate_image_paths(&conn, &image_dir);
     let (sw, sh) = get_resolution();
     let (origin_x, origin_y, _, _) = virtual_screen_rect();
@@ -4748,6 +4923,7 @@ fn main() -> eframe::Result {
             overlay_template: None,
             verify_bg: None,
             verify_rx: None,
+            verify_cancel: None,
             verify_gen: 0,
             health: std::collections::HashMap::new(),
             health_screen: (0, 0),
@@ -4971,6 +5147,60 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), b"newer");
         assert!(!dir.join("a_-n.png.bak").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn name_validation_blocks_path_escapes() {
+        assert!(validate_element_name("scene/foo").is_ok());
+        assert!(validate_element_name("plain").is_ok());
+        assert!(validate_element_name("../evil").is_err());
+        assert!(validate_element_name("scene/../../x").is_err());
+        assert!(validate_element_name("/abs").is_err());
+        assert!(validate_element_name("a/b/c").is_err());
+        assert!(validate_element_name("a\\b").is_err());
+        assert!(validate_element_name("a:b").is_err());
+        assert!(validate_element_name("a.").is_err());
+        assert!(validate_element_name("").is_err());
+        assert!(validate_state_name("-n").is_ok());
+        assert!(validate_state_name("../x").is_err());
+        assert!(validate_state_name("a/b").is_err());
+    }
+
+    #[test]
+    fn recover_backups_restores_missing_and_keeps_stale() {
+        let dir = std::env::temp_dir().join(format!("mr-recover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a_-n.png.bak"), b"old").unwrap();
+        fs::write(dir.join("b_-n.png"), b"new").unwrap();
+        fs::write(dir.join("b_-n.png.bak"), b"old").unwrap();
+
+        recover_image_backups(&dir.to_string_lossy());
+        assert_eq!(fs::read(dir.join("a_-n.png")).unwrap(), b"old");
+        assert!(!dir.join("a_-n.png.bak").exists());
+        // Both present: the backup is kept for manual inspection.
+        assert_eq!(fs::read(dir.join("b_-n.png")).unwrap(), b"new");
+        assert!(dir.join("b_-n.png.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_skips_ambiguous_basenames() {
+        let conn = init_db(":memory:");
+        let temp = std::env::temp_dir().join(format!("mr-ambig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("a")).unwrap();
+        fs::create_dir_all(temp.join("b")).unwrap();
+        fs::write(temp.join("a").join("foo_-n.png"), b"a").unwrap();
+        fs::write(temp.join("b").join("foo_-n.png"), b"b").unwrap();
+        create_elem(
+            &conn, "x", "-n", 10, 10, 60, 40, "foo_-n.png", 1920, 1080, 0, 0,
+        )
+        .unwrap();
+
+        migrate_image_paths(&conn, &temp.to_string_lossy());
+        assert_eq!(load_elements(&conn)[0].states[0].image_path, "foo_-n.png");
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]

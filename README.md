@@ -98,7 +98,11 @@ Screenshots are named `<element_name>_<state_name>.png` after both names are con
 
 Example: element `bangong`, state `-n` → `D:\elements\bangong_-n.png`
 
+Names may use one grouping level (`scene/foo`), which creates `data/scene/foo_-n.png` and stores the relative path in the DB. Path escapes (`..`, absolute paths, backslashes) and Windows-invalid filename characters are rejected before anything is written.
+
 The temporary `capture_<timestamp>.png` file is renamed automatically. If the rename fails (e.g. cross-device), the original timestamped path is kept.
+
+Committed captures keep the previous image as `<file>.png.bak` until the DB transaction commits. On startup, a `.png.bak` whose destination is missing is restored (crash recovery); if both files exist, the backup is kept for manual inspection and is replaced by the next capture of the same name.
 
 ---
 

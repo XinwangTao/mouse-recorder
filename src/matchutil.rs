@@ -99,11 +99,26 @@ pub struct MatchHit {
 }
 
 /// Coarse-then-refine search inside ROI (absolute screen coords).
+#[allow(dead_code)] // non-cancellable convenience API; app uses the cancellable variant
 pub fn find_template(
     screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     roi: Option<(i32, i32, i32, i32)>,
 ) -> Option<MatchHit> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    find_template_cancellable(screen, template, roi, &never)
+}
+
+/// Same as [`find_template`], but stops at the next row boundary when
+/// `cancel` becomes true (used by the async verify worker).
+pub fn find_template_cancellable(
+    screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    roi: Option<(i32, i32, i32, i32)>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<MatchHit> {
+    use std::sync::atomic::Ordering;
+
     let (sw, sh) = screen.dimensions();
     let (tw, th) = template.dimensions();
     if tw == 0 || th == 0 || tw > sw || th > sh {
@@ -133,6 +148,9 @@ pub fn find_template(
 
     let mut y = y0;
     while y <= max_y {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut x = x0;
         while x <= max_x {
             if let Some(s) = score_at_above(screen, template, x, y, best_score) {
@@ -152,6 +170,9 @@ pub fn find_template(
         let rx1 = (best.0 + step).min(max_x);
         let ry1 = (best.1 + step).min(max_y);
         for y in ry0..=ry1 {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             for x in rx0..=rx1 {
                 if let Some(s) = score_at_above(screen, template, x, y, best_score) {
                     if s > best_score {
@@ -181,19 +202,37 @@ pub fn find_template(
 }
 
 /// Prefer ROI; if score < threshold, also try full screen and keep the better hit.
+#[allow(dead_code)] // non-cancellable convenience API; app uses the cancellable variant
 pub fn find_template_smart(
     screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     roi: Option<(i32, i32, i32, i32)>,
     fallback_threshold: f32,
 ) -> Option<MatchHit> {
-    let in_roi = find_template(screen, template, roi);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    find_template_smart_cancellable(screen, template, roi, fallback_threshold, &never)
+}
+
+/// Same as [`find_template_smart`], with cancellation between passes.
+pub fn find_template_smart_cancellable(
+    screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    roi: Option<(i32, i32, i32, i32)>,
+    fallback_threshold: f32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<MatchHit> {
+    use std::sync::atomic::Ordering;
+
+    let in_roi = find_template_cancellable(screen, template, roi, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     if let Some(ref h) = in_roi {
         if h.score >= fallback_threshold {
             return in_roi;
         }
     }
-    let full = find_template(screen, template, None);
+    let full = find_template_cancellable(screen, template, None, cancel);
     match (in_roi, full) {
         (Some(a), Some(b)) => Some(if b.score > a.score { b } else { a }),
         (Some(a), None) => Some(a),
@@ -441,6 +480,18 @@ mod tests {
         assert_eq!(score_at_above(&screen, &template, 9, 7, 0.99), Some(1.0));
         // A bad candidate is rejected early.
         assert_eq!(score_at_above(&screen, &template, 0, 0, 0.99), None);
+    }
+
+    #[test]
+    fn cancellable_search_stops_when_cancelled() {
+        use std::sync::atomic::AtomicBool;
+        let screen = patterned(80, 80);
+        let template = patterned(8, 8);
+        let roi = Some((0, 0, 80, 80));
+        let cancelled = AtomicBool::new(true);
+        assert!(find_template_cancellable(&screen, &template, roi, &cancelled).is_none());
+        let run = AtomicBool::new(false);
+        assert!(find_template_cancellable(&screen, &template, roi, &run).is_some());
     }
 
     #[test]
