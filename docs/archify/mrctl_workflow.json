@@ -1,0 +1,209 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "mrctl · CLI 点击工作流与闭环反馈",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/archify/mrctl_workflow.html"
+  },
+  "lanes": [
+    {
+      "id": "cli",
+      "label": "命令行"
+    },
+    {
+      "id": "discover",
+      "label": "目标发现"
+    },
+    {
+      "id": "act",
+      "label": "动作与判定"
+    },
+    {
+      "id": "evidence",
+      "label": "证据与自迭代"
+    }
+  ],
+  "phases": [
+    {
+      "id": "intake",
+      "label": "解析 / 加载",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "find",
+      "label": "定位 / 换算",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "run",
+      "label": "执行 / 判定",
+      "fromCol": 4,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "mainPath": [
+    "cmd",
+    "flow",
+    "discover",
+    "resolve",
+    "act",
+    "assert",
+    "report"
+  ],
+  "nodes": [
+    {
+      "id": "cmd",
+      "lane": "cli",
+      "col": 0,
+      "type": "frontend",
+      "label": "mrctl 子命令",
+      "sublabel": "list / find / click / run",
+      "width": 150
+    },
+    {
+      "id": "flow",
+      "lane": "cli",
+      "col": 1,
+      "type": "frontend",
+      "label": "工作流文件",
+      "sublabel": "JSON / YAML 同 schema",
+      "width": 150
+    },
+    {
+      "id": "discover",
+      "lane": "discover",
+      "col": 2,
+      "type": "backend",
+      "label": "定位目标",
+      "sublabel": "UIA / 模板 / OCR",
+      "tag": "三路回退",
+      "width": 146
+    },
+    {
+      "id": "resolve",
+      "lane": "discover",
+      "col": 3,
+      "type": "backend",
+      "label": "换算屏幕坐标",
+      "sublabel": "origin + DPI + ROI",
+      "width": 150
+    },
+    {
+      "id": "act",
+      "lane": "act",
+      "col": 4,
+      "type": "messagebus",
+      "label": "执行动作",
+      "sublabel": "点击 / 输入 / 按键 / 等待",
+      "width": 156
+    },
+    {
+      "id": "assert",
+      "lane": "act",
+      "col": 5,
+      "type": "security",
+      "label": "判定成功",
+      "sublabel": "模板分 / 窗口 / OCR",
+      "width": 146
+    },
+    {
+      "id": "db",
+      "lane": "evidence",
+      "col": 2,
+      "type": "database",
+      "label": "元素库 / 图片",
+      "sublabel": "复用 GUI 数据",
+      "width": 140
+    },
+    {
+      "id": "adaptive",
+      "lane": "evidence",
+      "col": 4,
+      "type": "database",
+      "label": "自适应阈值",
+      "sublabel": "0.50–0.98",
+      "width": 140
+    },
+    {
+      "id": "report",
+      "lane": "evidence",
+      "col": 5,
+      "type": "database",
+      "label": "证据报告",
+      "sublabel": "截图 + 分数 + 耗时",
+      "width": 146
+    }
+  ],
+  "edges": [
+    {
+      "id": "cmd-flow",
+      "from": "cmd",
+      "to": "flow",
+      "label": "加载步骤",
+      "variant": "emphasis"
+    },
+    {
+      "id": "flow-discover",
+      "from": "flow",
+      "to": "discover",
+      "label": "第一步",
+      "variant": "default"
+    },
+    {
+      "id": "db-discover",
+      "from": "db",
+      "to": "discover",
+      "label": "已有元素",
+      "variant": "dashed"
+    },
+    {
+      "id": "discover-resolve",
+      "from": "discover",
+      "to": "resolve",
+      "label": "目标矩形",
+      "variant": "default"
+    },
+    {
+      "id": "resolve-act",
+      "from": "resolve",
+      "to": "act",
+      "label": "屏幕坐标",
+      "variant": "emphasis"
+    },
+    {
+      "id": "act-assert",
+      "from": "act",
+      "to": "assert",
+      "label": "动作完成",
+      "variant": "default"
+    },
+    {
+      "id": "assert-report",
+      "from": "assert",
+      "to": "report",
+      "label": "通过",
+      "variant": "emphasis"
+    },
+    {
+      "id": "adaptive-report",
+      "from": "adaptive",
+      "to": "report",
+      "label": "调阈值 / 标记重录",
+      "variant": "dashed"
+    },
+    {
+      "id": "assert-adaptive",
+      "from": "assert",
+      "to": "adaptive",
+      "label": "失败 / 重试超限",
+      "variant": "security",
+      "role": "error"
+    }
+  ]
+}
