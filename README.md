@@ -54,6 +54,11 @@ All geometry uses the same image-relative + `origin` model as the GUI; the CLI
 converts to virtual-screen coordinates before moving the mouse. `--rect`,
 `--coords` and `--roi` are always **virtual-screen** pixels.
 
+> Paths are resolved relative to the executable directory (`config.toml`,
+> `data/`). Use the packaged layout (exe beside `config.toml` + `data/`) or copy
+> the exe there; running `target/release/mouse-recorder.exe` uses
+> `target/release/data`.
+
 ### Workflow format (JSON or YAML, schema_version 1)
 
 ```yaml
