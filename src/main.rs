@@ -294,6 +294,38 @@ fn grab_primary_monitor() -> Result<image::RgbaImage, String> {
     grab_screen_gdi()
 }
 
+/// Intersect a drag rectangle with the captured image.
+///
+/// Inputs are rdev virtual-screen pixels and may be negative or past the image
+/// on a multi-monitor desktop; the result is always image-relative and never
+/// wraps. Returns `None` when the rectangle has no overlap.
+fn clamp_drag_to_image(
+    sx: i32,
+    sy: i32,
+    ex: i32,
+    ey: i32,
+    img_w: u32,
+    img_h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let x1 = sx.min(ex) as i64;
+    let y1 = sy.min(ey) as i64;
+    let x2 = sx.max(ex) as i64;
+    let y2 = sy.max(ey) as i64;
+    let cx0 = x1.max(0);
+    let cy0 = y1.max(0);
+    let cx1 = x2.min(img_w as i64);
+    let cy1 = y2.min(img_h as i64);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return None;
+    }
+    Some((
+        cx0 as u32,
+        cy0 as u32,
+        (cx1 - cx0) as u32,
+        (cy1 - cy0) as u32,
+    ))
+}
+
 fn find_element_id_by_name(conn: &Connection, name: &str) -> Option<i32> {
     conn.query_row(
         "SELECT id FROM elements WHERE name=?1 LIMIT 1",
@@ -577,12 +609,13 @@ fn png_size(path: &std::path::Path) -> Option<(u32, u32)> {
 }
 
 fn set_primary_state(conn: &Connection, element_id: i32, state_name: &str) -> Result<(), String> {
-    conn.execute(
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
         "UPDATE element_states SET is_primary=0 WHERE element_id=?1",
         params![element_id],
     )
     .map_err(|e| e.to_string())?;
-    let n = conn
+    let n = tx
         .execute(
             "UPDATE element_states SET is_primary=1 WHERE element_id=?1 AND state_name=?2",
             params![element_id, state_name],
@@ -591,6 +624,7 @@ fn set_primary_state(conn: &Connection, element_id: i32, state_name: &str) -> Re
     if n == 0 {
         return Err("State not found".into());
     }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -717,32 +751,68 @@ fn rename_element(
         .map_err(|e| e.to_string())?;
     drop(st);
 
+    // Preflight every target before touching the filesystem: a collision on the
+    // second state must not leave the first state already renamed.
+    let mut plan: Vec<(String, String, PathBuf, PathBuf)> = Vec::new();
     for (sn, path) in &rows {
         let old_path = std::path::Path::new(image_dir).join(path);
         let new_fname = format!("{}_{}.png", new_name, sn);
         let new_path = std::path::Path::new(image_dir).join(&new_fname);
-        if old_path.exists() {
-            if new_path.exists() && new_path != old_path {
-                return Err(format!("目标图片已存在: {}", new_fname));
-            }
-            if let Err(e) = fs::rename(&old_path, &new_path) {
-                fs::copy(&old_path, &new_path).map_err(|e2| {
-                    format!("rename failed ({e}); copy also failed: {e2}")
-                })?;
-                let _ = fs::remove_file(&old_path);
-            }
+        if old_path.exists() && new_path.exists() && new_path != old_path {
+            return Err(format!("目标图片已存在: {}", new_fname));
         }
-        conn.execute(
-            "UPDATE element_states SET image_path=?1 WHERE element_id=?2 AND state_name=?3",
-            params![new_fname, id, sn],
+        plan.push((sn.clone(), new_fname, old_path, new_path));
+    }
+
+    // Move files first, keeping a journal so a mid-way failure can be undone.
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (_, _, old_path, new_path) in &plan {
+        if !old_path.exists() {
+            continue;
+        }
+        let moved_ok = match fs::rename(old_path, new_path) {
+            Ok(()) => Ok(()),
+            Err(e) => match fs::copy(old_path, new_path) {
+                Ok(_) => {
+                    let _ = fs::remove_file(old_path);
+                    Ok(())
+                }
+                Err(e2) => Err(format!("rename failed ({e}); copy also failed: {e2}")),
+            },
+        };
+        if let Err(e) = moved_ok {
+            for (o, n) in moved.iter().rev() {
+                let _ = fs::rename(n, o);
+            }
+            return Err(e);
+        }
+        moved.push((old_path.clone(), new_path.clone()));
+    }
+
+    // Then commit name/path metadata atomically. Any DB failure restores the
+    // files moved above, so the pair stays consistent.
+    let db_result: Result<(), String> = (|| {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        for (sn, new_fname, _, _) in &plan {
+            tx.execute(
+                "UPDATE element_states SET image_path=?1 WHERE element_id=?2 AND state_name=?3",
+                params![new_fname.as_str(), id, sn.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE elements SET name=?1 WHERE id=?2",
+            params![new_name, id],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    })();
+    if let Err(e) = db_result {
+        for (o, n) in moved.iter().rev() {
+            let _ = fs::rename(n, o);
+        }
+        return Err(e);
     }
-    conn.execute(
-        "UPDATE elements SET name=?1 WHERE id=?2",
-        params![new_name, id],
-    )
-    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1146,45 +1216,59 @@ enum CaptureMsg {
 
 fn start_listener(flag: Arc<AtomicBool>, tx: Sender<CaptureMsg>) {
     thread::spawn(move || {
-        let last_pos: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((0.0, 0.0)));
-        let last_pos_cb = Arc::clone(&last_pos);
-        let cb = move |event: Event| -> Option<Event> {
-            let capturing = flag.load(Ordering::Relaxed);
-            match event.event_type {
-                EventType::MouseMove { x, y } => {
-                    if let Ok(mut pos) = last_pos_cb.lock() {
-                        *pos = (x, y);
-                    }
-                    if capturing {
-                        tx.send(CaptureMsg::Move(x, y)).ok();
-                    }
-                    Some(event)
-                }
-                EventType::ButtonPress(Button::Left) => {
-                    if capturing {
-                        if let Ok(pos) = last_pos_cb.lock() {
-                            tx.send(CaptureMsg::Down(pos.0, pos.1)).ok();
+        // `grab` blocks until the hook dies. Retry instead of silently leaving
+        // the app unable to record for the rest of the session.
+        loop {
+            let last_pos_cb: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((0.0, 0.0)));
+            let flag_cb = Arc::clone(&flag);
+            let cb = {
+                let tx = tx.clone();
+                move |event: Event| -> Option<Event> {
+                    let capturing = flag_cb.load(Ordering::Relaxed);
+                    match event.event_type {
+                        EventType::MouseMove { x, y } => {
+                            if let Ok(mut pos) = last_pos_cb.lock() {
+                                *pos = (x, y);
+                            }
+                            if capturing {
+                                tx.send(CaptureMsg::Move(x, y)).ok();
+                            }
+                            Some(event)
                         }
-                        None
-                    } else {
-                        Some(event)
-                    }
-                }
-                EventType::ButtonRelease(Button::Left) => {
-                    if capturing {
-                        if let Ok(pos) = last_pos_cb.lock() {
-                            tx.send(CaptureMsg::Up(pos.0, pos.1)).ok();
+                        EventType::ButtonPress(Button::Left) => {
+                            if capturing {
+                                if let Ok(pos) = last_pos_cb.lock() {
+                                    tx.send(CaptureMsg::Down(pos.0, pos.1)).ok();
+                                }
+                                None
+                            } else {
+                                Some(event)
+                            }
                         }
-                        None
-                    } else {
-                        Some(event)
+                        EventType::ButtonRelease(Button::Left) => {
+                            if capturing {
+                                if let Ok(pos) = last_pos_cb.lock() {
+                                    tx.send(CaptureMsg::Up(pos.0, pos.1)).ok();
+                                }
+                                None
+                            } else {
+                                Some(event)
+                            }
+                        }
+                        _ => Some(event),
                     }
                 }
-                _ => Some(event),
+            };
+            match grab(cb) {
+                Ok(()) => break,
+                Err(e) => {
+                    log_error(&format!(
+                        "rdev grab error: {:?} — retrying in 2s",
+                        e
+                    ));
+                    thread::sleep(Duration::from_secs(2));
+                }
             }
-        };
-        if let Err(e) = grab(cb) {
-            log_error(&format!("rdev grab error: {:?}", e));
         }
     });
 }
@@ -1361,6 +1445,9 @@ impl RecorderApp {
         self.elements = load_elements(&self.conn);
         self.sync_last_selection();
         self.rebuild_health_cache();
+        // Recapture/overwrite writes a new PNG at the same path, so a texture
+        // cached by path would keep showing the old screenshot.
+        self.preview = None;
     }
 
     fn sync_last_selection(&mut self) {
@@ -3231,38 +3318,34 @@ impl eframe::App for RecorderApp {
 
                             let result = match (saved_start, pre_img) {
                                 (Some((sx, sy)), Some((_tex, full))) => {
-                                    let px = sx.min(x as i32);
-                                    let py = sy.min(y as i32);
-                                    let pw = (sx - x as i32).abs() as u32;
-                                    let ph = (sy - y as i32).abs() as u32;
-                                    if pw == 0 || ph == 0 {
-                                        Err("Zero region".into())
-                                    } else {
-                                        let lpx = (px as u32).min(full.width().saturating_sub(1));
-                                        let lpy = (py as u32).min(full.height().saturating_sub(1));
-                                        let lpw = pw.min(full.width().saturating_sub(lpx));
-                                        let lph = ph.min(full.height().saturating_sub(lpy));
-                                        if lpw == 0 || lph == 0 {
-                                            Err("Region out of bounds".into())
-                                        } else {
-                                            let ts = Local::now().format("%Y%m%d_%H%M%S_%3f");
-                                            let _ = fs::create_dir_all(&self.image_dir);
-                                            let path = std::path::Path::new(&self.image_dir)
-                                                .join(format!("capture_{}.png", ts));
-                                            let path_s = path.to_string_lossy().to_string();
-                                            let cropped =
-                                                image::imageops::crop_imm(&full, lpx, lpy, lpw, lph)
-                                                    .to_image();
-                                            match cropped.save(&path) {
-                                                Ok(_) => Ok((
-                                                    lpx as i32,
-                                                    lpy as i32,
-                                                    (lpx + lpw) as i32,
-                                                    (lpy + lph) as i32,
-                                                    path_s,
-                                                )),
-                                                Err(e) => Err(format!("Save failed: {}", e)),
-                                            }
+                                    // rdev reports virtual-screen pixels, which can be
+                                    // negative or larger than the primary capture on a
+                                    // multi-monitor setup. Clamp in i64 BEFORE casting to
+                                    // u32: `(-10i32) as u32` would otherwise wrap to a
+                                    // huge value and silently crop the far edge.
+                                    match clamp_drag_to_image(
+                                        sx, sy, x as i32, y as i32, full.width(), full.height(),
+                                    ) {
+                                        None => Err("Region outside captured screen".into()),
+                                        Some((lpx, lpy, lpw, lph)) => {
+                                        let ts = Local::now().format("%Y%m%d_%H%M%S_%3f");
+                                        let _ = fs::create_dir_all(&self.image_dir);
+                                        let path = std::path::Path::new(&self.image_dir)
+                                            .join(format!("capture_{}.png", ts));
+                                        let path_s = path.to_string_lossy().to_string();
+                                        let cropped =
+                                            image::imageops::crop_imm(&full, lpx, lpy, lpw, lph)
+                                                .to_image();
+                                        match cropped.save(&path) {
+                                            Ok(_) => Ok((
+                                                lpx as i32,
+                                                lpy as i32,
+                                                (lpx + lpw) as i32,
+                                                (lpy + lph) as i32,
+                                                path_s,
+                                            )),
+                                            Err(e) => Err(format!("Save failed: {}", e)),
+                                        }
                                         }
                                     }
                                 }
@@ -4323,6 +4406,59 @@ mod tests {
         assert_eq!(get_next_state_suffix("-n"), "-s");
         assert_eq!(get_next_state_suffix("-p"), "-n");
         assert_eq!(get_next_state_suffix("-cs"), "-n");
+    }
+
+    #[test]
+    fn drag_rect_clamps_negative_and_oversized_coords() {
+        // Selection starts left/above the primary monitor: must not wrap.
+        assert_eq!(
+            clamp_drag_to_image(-50, -30, 50, 40, 1920, 1080),
+            Some((0, 0, 50, 40))
+        );
+        // Entirely off-screen: reject instead of cropping the far edge.
+        assert_eq!(clamp_drag_to_image(-100, -100, -10, -10, 1920, 1080), None);
+        // Normal selection.
+        assert_eq!(
+            clamp_drag_to_image(10, 20, 110, 80, 1920, 1080),
+            Some((10, 20, 100, 60))
+        );
+        // Selection runs past the bottom-right corner.
+        assert_eq!(
+            clamp_drag_to_image(1900, 1000, 2000, 1100, 1920, 1080),
+            Some((1900, 1000, 20, 80))
+        );
+        // Zero width/height.
+        assert_eq!(clamp_drag_to_image(10, 10, 10, 50, 1920, 1080), None);
+    }
+
+    #[test]
+    fn rename_moves_files_updates_db_and_preflights_collisions() {
+        let conn = init_db(":memory:");
+        let temp = std::env::temp_dir().join(format!("mr-rename-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let dir = temp.to_string_lossy().to_string();
+
+        let id = create_elem(
+            &conn, "old", "-n", 10, 10, 60, 40, "old_-n.png", 1920, 1080,
+        )
+        .unwrap();
+        fs::write(temp.join("old_-n.png"), b"img").unwrap();
+
+        rename_element(&conn, &dir, id, "old", "new").unwrap();
+        assert!(temp.join("new_-n.png").exists());
+        assert!(!temp.join("old_-n.png").exists());
+        let els = load_elements(&conn);
+        assert_eq!(els[0].name, "new");
+        assert_eq!(els[0].states[0].image_path, "new_-n.png");
+
+        // A stray target file must fail the preflight WITHOUT moving the source.
+        fs::write(temp.join("taken_-n.png"), b"other").unwrap();
+        assert!(rename_element(&conn, &dir, id, "new", "taken").is_err());
+        assert!(temp.join("new_-n.png").exists());
+        assert_eq!(load_elements(&conn)[0].name, "new");
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]

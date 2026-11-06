@@ -5,29 +5,85 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Same score as mouse-suite clicker: 1 - mean(|ΔRGB|) / (255*3).
+///
+/// Exact-score API for callers that need the real value; the search itself uses
+/// [`score_at_above`] so it can abort losing candidates early.
+#[allow(dead_code)]
 pub fn score_at(
     screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     ox: u32,
     oy: u32,
 ) -> f32 {
+    score_at_inner(screen, template, ox, oy, f32::NEG_INFINITY).unwrap_or(0.0)
+}
+
+/// Exact SAD score, but stop as soon as zero error on the remaining pixels
+/// could no longer lift the result above `min_score`.
+///
+/// The matcher only needs to know whether a candidate beats the current best.
+/// Once the partial error sum is past `(1 - min_score) * 765 * n`, the final
+/// score is guaranteed `<= min_score`, so the rest of the template can be
+/// skipped. This turns most full-screen candidates into a few-row scan.
+pub fn score_at_above(
+    screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    ox: u32,
+    oy: u32,
+    min_score: f32,
+) -> Option<f32> {
+    score_at_inner(screen, template, ox, oy, min_score)
+}
+
+fn score_at_inner(
+    screen: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    template: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    ox: u32,
+    oy: u32,
+    min_score: f32,
+) -> Option<f32> {
+    let (sw, sh) = screen.dimensions();
     let (tw, th) = template.dimensions();
-    let mut sum = 0i64;
-    let mut n = 0u32;
-    for ty in 0..th {
-        for tx in 0..tw {
-            let sp = screen.get_pixel(ox + tx, oy + ty);
-            let tp = template.get_pixel(tx, ty);
-            sum += (sp[0] as i32 - tp[0] as i32).abs() as i64
-                + (sp[1] as i32 - tp[1] as i32).abs() as i64
-                + (sp[2] as i32 - tp[2] as i32).abs() as i64;
-            n += 1;
+    if tw == 0
+        || th == 0
+        || ox.checked_add(tw).is_none_or(|v| v > sw)
+        || oy.checked_add(th).is_none_or(|v| v > sh)
+    {
+        return None;
+    }
+
+    let n = (tw as u64) * (th as u64);
+    let screen_raw = screen.as_raw();
+    let template_raw = template.as_raw();
+    let screen_stride = sw as usize * 4;
+    let row_bytes = tw as usize * 4;
+    // Abort threshold in absolute RGB error units. `-inf` (no current best)
+    // disables early exit.
+    let threshold = if min_score.is_finite() {
+        (1.0 - min_score) as f64 * 765.0 * n as f64
+    } else {
+        f64::INFINITY
+    };
+
+    let mut sum: i64 = 0;
+    for ty in 0..th as usize {
+        let s_start = (oy as usize + ty) * screen_stride + ox as usize * 4;
+        let t_start = ty * row_bytes;
+        let srow = &screen_raw[s_start..s_start + row_bytes];
+        let trow = &template_raw[t_start..t_start + row_bytes];
+        for (sp, tp) in srow.chunks_exact(4).zip(trow.chunks_exact(4)) {
+            sum += (sp[0] as i32 - tp[0] as i32).unsigned_abs() as i64
+                + (sp[1] as i32 - tp[1] as i32).unsigned_abs() as i64
+                + (sp[2] as i32 - tp[2] as i32).unsigned_abs() as i64;
+        }
+        // `>=` is safe: a final score exactly equal to the best would not
+        // replace it (`>` in the search loop).
+        if sum as f64 >= threshold {
+            return None;
         }
     }
-    if n == 0 {
-        return 0.0;
-    }
-    1.0 - (sum as f32 / n as f32) / (255.0 * 3.0)
+
+    Some(1.0 - (sum as f32 / n as f32) / (255.0 * 3.0))
 }
 
 #[derive(Clone, Debug)]
@@ -79,10 +135,11 @@ pub fn find_template(
     while y <= max_y {
         let mut x = x0;
         while x <= max_x {
-            let s = score_at(screen, template, x, y);
-            if s > best_score {
-                best_score = s;
-                best = (x, y);
+            if let Some(s) = score_at_above(screen, template, x, y, best_score) {
+                if s > best_score {
+                    best_score = s;
+                    best = (x, y);
+                }
             }
             x += step;
         }
@@ -96,10 +153,11 @@ pub fn find_template(
         let ry1 = (best.1 + step).min(max_y);
         for y in ry0..=ry1 {
             for x in rx0..=rx1 {
-                let s = score_at(screen, template, x, y);
-                if s > best_score {
-                    best_score = s;
-                    best = (x, y);
+                if let Some(s) = score_at_above(screen, template, x, y, best_score) {
+                    if s > best_score {
+                        best_score = s;
+                        best = (x, y);
+                    }
                 }
             }
         }
@@ -340,5 +398,73 @@ mod tests {
         );
         assert!(r.badges.contains(&"重名"));
         assert!(r.badges.contains(&"分辨率"));
+    }
+
+    fn patterned(w: u32, h: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+        ImageBuffer::from_fn(w, h, |x, y| {
+            Rgba([
+                ((x * 37 + y * 11) % 256) as u8,
+                ((x * 13 + y * 53) % 256) as u8,
+                ((x * 71 + y * 7) % 256) as u8,
+                255,
+            ])
+        })
+    }
+
+    #[test]
+    fn score_at_is_exact_for_identical_region() {
+        let template = patterned(16, 16);
+        let mut screen = patterned(40, 40);
+        for ty in 0..16 {
+            for tx in 0..16 {
+                screen.put_pixel(10 + tx, 12 + ty, *template.get_pixel(tx, ty));
+            }
+        }
+        assert_eq!(score_at(&screen, &template, 10, 12), 1.0);
+        assert!(score_at(&screen, &template, 11, 12) < 1.0);
+        // Out-of-bounds is a miss, not a panic.
+        assert_eq!(score_at(&screen, &template, 100, 100), 0.0);
+    }
+
+    #[test]
+    fn early_abort_only_skips_candidates_that_cannot_win() {
+        let template = patterned(12, 12);
+        let mut screen = patterned(40, 40);
+        for ty in 0..12 {
+            for tx in 0..12 {
+                screen.put_pixel(9 + tx, 7 + ty, *template.get_pixel(tx, ty));
+            }
+        }
+        // Exact match cannot beat a 1.0 best, so it is skipped; it still beats
+        // a 0.99 best and must be returned exactly.
+        assert_eq!(score_at_above(&screen, &template, 9, 7, 1.0), None);
+        assert_eq!(score_at_above(&screen, &template, 9, 7, 0.99), Some(1.0));
+        // A bad candidate is rejected early.
+        assert_eq!(score_at_above(&screen, &template, 0, 0, 0.99), None);
+    }
+
+    #[test]
+    fn find_template_matches_brute_force_best() {
+        let template = patterned(8, 8);
+        let mut screen = patterned(40, 40);
+        for ty in 0..8 {
+            for tx in 0..8 {
+                screen.put_pixel(21 + tx, 13 + ty, *template.get_pixel(tx, ty));
+            }
+        }
+        let roi = Some((0, 0, 40, 40));
+        let hit = find_template(&screen, &template, roi).expect("hit");
+
+        let mut best = (0u32, 0u32, f32::NEG_INFINITY);
+        for y in 0..=(40 - 8) {
+            for x in 0..=(40 - 8) {
+                let s = score_at(&screen, &template, x, y);
+                if s > best.2 {
+                    best = (x, y, s);
+                }
+            }
+        }
+        assert_eq!((hit.hit_x as u32, hit.hit_y as u32), (best.0, best.1));
+        assert_eq!(hit.score, best.2);
     }
 }

@@ -229,5 +229,7 @@ Pure helpers (ROI math, health assessment, DB loading) are covered by unit tests
 - The element list renders from a cached health report per element (image existence + PNG dimensions are read on refresh/screen change, not every frame).
 - State loading uses one `LEFT JOIN` query instead of one query per element.
 - `element_states(element_id)` is indexed.
+- Template matching aborts a candidate as soon as its remaining pixels cannot beat the current best, and scans raw pixel rows. Scores and hit coordinates match the brute-force SAD result.
+- Capture intersects the drag rectangle in 64-bit space before converting to image coordinates, so negative multi-monitor coordinates cannot wrap.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
