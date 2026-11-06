@@ -1640,6 +1640,7 @@ fn park_window_offscreen(frame: &eframe::Frame) -> bool {
         SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
     };
     if let Some(hwnd) = win32_hwnd(frame) {
+        log_error("park_window_offscreen: moving window to -32000");
         unsafe {
             SetWindowPos(
                 hwnd,
@@ -1763,6 +1764,8 @@ struct RecorderApp {
     scale: f32,
     mode: AppMode,
     input: String,
+    /// Focus the name/state text box once when its prompt opens.
+    focus_input: bool,
     /// Case-insensitive substring filter for the element list.
     name_filter: String,
     /// Scene group (`name` prefix before `/`); empty or "全部" = all.
@@ -2576,6 +2579,33 @@ impl RecorderApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         let _ = place_window_normal(frame);
+        // Viewport commands can be ignored while the window was parked/fullscreen;
+        // force a sane on-screen rect in physical pixels as well.
+        #[cfg(windows)]
+        if let Some(hwnd) = win32_hwnd(frame) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, HWND_NOTOPMOST, SWP_NOZORDER, SWP_SHOWWINDOW,
+            };
+            let s = self.scale.max(0.1);
+            let x = (100.0 * s) as i32;
+            let y = (100.0 * s) as i32;
+            let w = (920.0 * s) as i32;
+            let h = (700.0 * s) as i32;
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_SHOWWINDOW,
+                );
+            }
+            log_error(&format!(
+                "restore_main_window: forced physical rect ({x},{y}) {w}x{h}"
+            ));
+        }
     }
 
     fn end_capture(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -4023,6 +4053,7 @@ impl eframe::App for RecorderApp {
                                         }
                                     } else {
                                         self.mode = AppMode::InputName(x1, y1, x2, y2, img_path);
+                                        self.focus_input = true;
                                         self.input.clear();
                                         self.status = "Enter element name:".into();
                                     }
@@ -4408,6 +4439,7 @@ impl eframe::App for RecorderApp {
                                             .clone()
                                             .unwrap_or_default();
                                         self.mode = AppMode::InputRename;
+                                        self.focus_input = true;
                                         self.status = "输入新名称:".into();
                                     }
                                     if ui.button("状态对比").clicked() {
@@ -4436,6 +4468,7 @@ impl eframe::App for RecorderApp {
                                 if ui.button("Export CSV").clicked() {
                                     self.mode = AppMode::InputExport;
                                     self.input.clear();
+                                    self.focus_input = true;
                                     self.status = "Enter export filename:".into();
                                 }
                                 if ui.button("打开目录").clicked() {
@@ -4477,7 +4510,11 @@ impl eframe::App for RecorderApp {
                         }
                         AppMode::InputRename => {
                             ui.label("改名 Rename（重名会拦截）:");
-                            ui.text_edit_singleline(&mut self.input);
+                            let resp = ui.text_edit_singleline(&mut self.input);
+                            if self.focus_input {
+                                resp.request_focus();
+                                self.focus_input = false;
+                            }
                             ui.horizontal(|ui| {
                                 if ui.button("确认改名").clicked()
                                     || ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -4800,6 +4837,10 @@ impl eframe::App for RecorderApp {
                             };
                             ui.label(prompt);
                             let resp = ui.text_edit_singleline(&mut self.input);
+                            if self.focus_input {
+                                resp.request_focus();
+                                self.focus_input = false;
+                            }
                             ui.horizontal(|ui| {
                                 if ui.button("OK").clicked() || (resp.has_focus() && ui.input_mut(|i| i.key_pressed(egui::Key::Enter))) {
                                     let val = self.input.trim().to_string();
@@ -4809,6 +4850,7 @@ impl eframe::App for RecorderApp {
                                             self.mode = AppMode::InputState(
                                                 x1, y1, x2, y2, img, val, "-n".to_string(),
                                             );
+                                            self.focus_input = true;
                                             self.input.clear();
                                             self.status = "Enter state name (default: -n):".into();
                                         }
@@ -4906,6 +4948,7 @@ fn main() -> eframe::Result {
             scale: 1.0,
             mode: AppMode::Normal,
             input: String::new(),
+            focus_input: false,
             name_filter: String::new(),
             group_filter: String::new(),
             recapture: false,

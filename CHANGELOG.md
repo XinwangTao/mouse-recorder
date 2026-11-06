@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.2] — 2026-11-06
+
+### Fixed
+- After a fullscreen capture/verify overlay, force the main window back to a
+  sane on-screen physical rect. Viewport commands alone could leave it
+  minimized/off-screen (`-32000`) after the overlay.
+- Auto-focus the element/state/rename/export input box when its prompt opens.
+
 ## [0.6.1] — 2026-11-06
 
 ### Fixed
