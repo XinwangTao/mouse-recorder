@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.3] — 2026-11-09
+
+### Fixed
+- UIA targets behind another window are no longer clicked through. `click --uia`
+  and workflow `uia` targets now raise the target window (AttachThreadInput
+  bypass, no-activate z-order fallback), re-read the control rect *after* the
+  raise, and refuse to click when `WindowFromPoint` still reports a covering
+  window (exit 3, `--force` overrides). Previously the click landed on whatever
+  window happened to be on top — found on a live desktop where a terminal
+  covered Explorer's address bar.
+- Workflow `--dry-run` no longer raises windows; it has no desktop side effects.
+
+### Verified
+- End-to-end on a live desktop: UIA locate an Edit control → click to focus →
+  type `HELLO OCR 2026` → OCR read-back `HELLO` at 96.3% confidence, exit 0.
+
 ## [0.7.2] — 2026-11-06
 
 ### Fixed

@@ -121,7 +121,7 @@ Commands:
   verify (--element NAME[:STATE] | --template PATH)
          [--threshold F] [--json]
   click  (--element NAME[:STATE] | --template PATH | --uia | --coords x,y)
-         [--window TITLE] [--double] [--right] [--verify] [--json]
+         [--window TITLE] [--double] [--right] [--verify] [--force] [--json]
   ocr    --text TEXT [--image PATH | --window TITLE]
          [--lang eng] [--json]
   uia    --window TITLE [--json] [--max N] [--depth N]
@@ -158,7 +158,7 @@ pub(crate) struct Opts {
 }
 
 const BOOL_FLAGS: &[&str] = &[
-    "json", "double", "right", "verify", "overwrite", "dry-run", "uia",
+    "json", "double", "right", "verify", "overwrite", "dry-run", "uia", "force",
 ];
 
 impl Opts {
@@ -994,8 +994,32 @@ fn cmd_click(args: &[String]) -> i32 {
         let Some(sel) = uia::Selector::from_opts(&opts) else {
             return usage("--uia 需要 --name / --automation-id / --class / --control-type");
         };
+        // Raise first: the click coords must be read after the window settles,
+        // otherwise a window that moves during activation gets clicked at its
+        // old position.
+        if let Err(e) = uia::raise_window(&win) {
+            return fail(5, format!("提升窗口失败: {e}"));
+        }
         match uia::find(&win, &sel) {
-            Ok(Some(n)) => (n.cx(), n.cy(), None),
+            Ok(Some(n)) => {
+                let (cx, cy) = (n.cx(), n.cy());
+                if !opts.flag("force") {
+                    match uia::occluder_at(&win, cx, cy) {
+                        Ok(None) => {}
+                        Ok(Some(blocker)) => {
+                            return fail(
+                                3,
+                                format!(
+                                    "目标控件 ({} \"{}\" @ {cx},{cy}) 被其他窗口遮挡：{blocker}；未点击（--force 可强制）",
+                                    n.control_type_name, n.name
+                                ),
+                            );
+                        }
+                        Err(e) => return fail(5, e),
+                    }
+                }
+                (cx, cy, None)
+            }
             Ok(None) => return fail(3, "UIA 未找到目标控件"),
             Err(e) => return fail(5, e),
         }

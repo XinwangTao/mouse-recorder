@@ -103,6 +103,13 @@ returns screen coordinates. UIA covers standard Win32/WPF/UWP controls;
 canvas/game UIs fall back to template or OCR. `--uia` requires `--window`;
 minimized windows and zero-size controls are skipped.
 
+Before clicking a UIA target the CLI raises the owning window (UIA can read a
+covered window, `SendInput` cannot) and re-reads the control rect, then checks
+`WindowFromPoint`: if another window is still on top of that point the click is
+refused with exit 3 instead of landing on the wrong app. Pass `--force` to skip
+that check. Workflow `uia` targets get the same guard; `--dry-run` raises
+nothing.
+
 `--dry-run` only resolves targets — it performs no actions and runs no
 assertions. In a workflow, `type`/`key` steps with a `target` click it first to
 focus it; without a target they type into the foreground window.

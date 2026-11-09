@@ -223,6 +223,7 @@ fn resolve_target(
     t: &Target,
     threshold: f32,
     report_dir: &Path,
+    interactive: bool,
 ) -> Result<Resolved, String> {
     let kind = if t.kind.is_empty() { "element" } else { t.kind.as_str() };
     let screen = cli::capture()?;
@@ -297,8 +298,22 @@ fn resolve_target(
                 return Err("UIA target needs window".into());
             }
             let sel = selector(t);
+            // Raise first so the node rect is read from the settled window and
+            // clicks/keystrokes reach it rather than whatever is on top.
+            // Dry-run never touches the desktop, so it skips both steps.
+            if interactive {
+                uia::raise_window(window).map_err(|e| format!("raise window: {e}"))?;
+            }
             let node = uia::find(window, &sel)?
                 .ok_or_else(|| format!("UIA target not found in {window}"))?;
+            if interactive {
+                if let Some(blocker) = uia::occluder_at(window, node.cx(), node.cy())? {
+                    return Err(format!(
+                        "UIA target occluded by window: {blocker} ({} \"{}\")",
+                        node.control_type_name, node.name
+                    ));
+                }
+            }
             Ok(Resolved {
                 x: node.cx(),
                 y: node.cy(),
@@ -451,7 +466,7 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
             let result = (|| -> Result<(Option<f32>, Option<String>, cli::Screen), String> {
                 let mut resolved: Option<Resolved> = None;
                 if let Some(target) = &step.target {
-                    let r = resolve_target(&cfg, &conn, step, target, threshold, &dir)?;
+                    let r = resolve_target(&cfg, &conn, step, target, threshold, &dir, !dry_run)?;
                     detail = Some(r.detail.clone());
                     score = r.score;
                     resolved = Some(r);

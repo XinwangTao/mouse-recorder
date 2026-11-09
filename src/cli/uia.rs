@@ -308,3 +308,75 @@ pub fn find(window: &str, selector: &Selector) -> Result<Option<UiaNode>, String
 pub fn window_exists(title: &str) -> bool {
     find_window(title).is_ok()
 }
+
+/// Raise `title` to the foreground so synthetic clicks and keystrokes land on
+/// it rather than on whatever happens to be on top.
+///
+/// UIA can read a covered window; SendInput cannot reach it. Windows only lets
+/// the foreground process steal focus, so we attach to the current foreground
+/// thread first (the documented bypass) and fall back to a no-activate z-order
+/// bump.
+pub fn raise_window(title: &str) -> Result<(), String> {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+        SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+        SW_RESTORE,
+    };
+    let hwnd = find_window(title)?;
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        if GetForegroundWindow() == hwnd {
+            return Ok(());
+        }
+        let fg = GetForegroundWindow();
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let me = GetCurrentThreadId();
+        let attached = fg_tid != 0 && fg_tid != me && AttachThreadInput(me, fg_tid, BOOL(1)).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let activated = SetForegroundWindow(hwnd).as_bool();
+        if attached {
+            let _ = AttachThreadInput(me, fg_tid, BOOL(0));
+        }
+        if !activated || GetForegroundWindow() != hwnd {
+            // Best effort: at least put it on top so a click reaches it.
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+    // Give the compositor a moment to finish the z-order change, otherwise
+    // WindowFromPoint still reports the old top window.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    Ok(())
+}
+
+/// `Ok(None)` when the point really hits `title`'s window, otherwise the title
+/// of the window that would receive the click. Guards against clicking through
+/// to a covering window when a UIA target is occluded.
+pub fn occluder_at(title: &str, x: i32, y: i32) -> Result<Option<String>, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOT};
+    let hwnd = find_window(title)?;
+    let hit = unsafe { WindowFromPoint(windows::Win32::Foundation::POINT { x, y }) };
+    if hit.0.is_null() {
+        return Ok(Some("<无窗口>".to_string()));
+    }
+    let root = unsafe { GetAncestor(hit, GA_ROOT) };
+    if hit == hwnd || root == hwnd {
+        return Ok(None);
+    }
+    let name = window_title(root);
+    Ok(Some(if name.is_empty() {
+        "<无标题窗口>".to_string()
+    } else {
+        name
+    }))
+}
