@@ -309,6 +309,45 @@ pub fn window_exists(title: &str) -> bool {
     find_window(title).is_ok()
 }
 
+/// UIA element under a screen point plus the title of its top-level window.
+/// Used by `record-workflow` to turn a click into a UIA target.
+pub fn node_at(x: i32, y: i32) -> Option<(UiaNode, Option<String>)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+    let automation = automation().ok()?;
+    let el = unsafe {
+        automation.ElementFromPoint(windows::Win32::Foundation::POINT { x, y })
+    }
+    .ok()?;
+    let node = read_node(&el, 0);
+    if node.w <= 0 || node.h <= 0 {
+        return None;
+    }
+    let title = unsafe { el.CurrentNativeWindowHandle() }
+        .ok()
+        .filter(|h| !h.0.is_null())
+        .map(|h| unsafe { GetAncestor(h, GA_ROOT) })
+        .map(window_title)
+        .filter(|t| !t.is_empty());
+    Some((node, title))
+}
+
+/// Title of the top-level window under a screen point (ignored windows are
+/// skipped by the caller via [`occluder_at`]).
+pub fn window_title_at(x: i32, y: i32) -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOT};
+    let hit = unsafe { WindowFromPoint(windows::Win32::Foundation::POINT { x, y }) };
+    if hit.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hit, GA_ROOT) };
+    let t = window_title(root);
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 /// Raise `title` to the foreground so synthetic clicks and keystrokes land on
 /// it rather than on whatever happens to be on top.
 ///
@@ -317,6 +356,13 @@ pub fn window_exists(title: &str) -> bool {
 /// thread first (the documented bypass) and fall back to a no-activate z-order
 /// bump.
 pub fn raise_window(title: &str) -> Result<(), String> {
+    raise_window_with(title, 3)
+}
+
+/// Same as [`raise_window`] with an explicit number of attempts. Another
+/// process that keeps grabbing the foreground can win a single race, so we
+/// retry a few times before giving up.
+pub fn raise_window_with(title: &str, attempts: u32) -> Result<(), String> {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
@@ -324,38 +370,42 @@ pub fn raise_window(title: &str) -> Result<(), String> {
         SW_RESTORE,
     };
     let hwnd = find_window(title)?;
-    unsafe {
-        if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            if GetForegroundWindow() == hwnd {
+                break;
+            }
+            let fg = GetForegroundWindow();
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            let me = GetCurrentThreadId();
+            let attached =
+                fg_tid != 0 && fg_tid != me && AttachThreadInput(me, fg_tid, BOOL(1)).as_bool();
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            if attached {
+                let _ = AttachThreadInput(me, fg_tid, BOOL(0));
+            }
+            if GetForegroundWindow() != hwnd {
+                // At least put it on top so a click reaches it.
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
         }
-        if GetForegroundWindow() == hwnd {
-            return Ok(());
-        }
-        let fg = GetForegroundWindow();
-        let fg_tid = GetWindowThreadProcessId(fg, None);
-        let me = GetCurrentThreadId();
-        let attached = fg_tid != 0 && fg_tid != me && AttachThreadInput(me, fg_tid, BOOL(1)).as_bool();
-        let _ = BringWindowToTop(hwnd);
-        let activated = SetForegroundWindow(hwnd).as_bool();
-        if attached {
-            let _ = AttachThreadInput(me, fg_tid, BOOL(0));
-        }
-        if !activated || GetForegroundWindow() != hwnd {
-            // Best effort: at least put it on top so a click reaches it.
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOP,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-        }
+        // Give the compositor a moment to finish the z-order change, otherwise
+        // WindowFromPoint still reports the old top window.
+        std::thread::sleep(std::time::Duration::from_millis(if attempt == 0 { 150 } else { 80 }));
     }
-    // Give the compositor a moment to finish the z-order change, otherwise
-    // WindowFromPoint still reports the old top window.
-    std::thread::sleep(std::time::Duration::from_millis(150));
     Ok(())
 }
 

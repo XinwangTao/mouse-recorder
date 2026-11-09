@@ -10,8 +10,11 @@ use std::time::Instant;
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Defaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
 }
 
@@ -19,51 +22,98 @@ pub struct Defaults {
 pub struct Workflow {
     pub schema_version: u32,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default)]
     pub defaults: Defaults,
+    /// Initial variables, expanded as `${name}` in text/key/target fields.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub vars: HashMap<String, String>,
     pub steps: Vec<Step>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Step {
     pub id: String,
     pub action: String,
-    #[serde(default)]
-    pub target: Option<Target>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<Target>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fail: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
+    /// `wait_for` poll budget; defaults to `ms` or 5000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// `wait_for` poll interval; defaults to 250ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_ms: Option<u64>,
+    /// Store resolved values as variables: `var: source`, where source is one
+    /// of `x y score text uia_name uia_automation_id uia_control_type
+    /// ocr_text element detail`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub save: HashMap<String, String>,
+}
+
+/// A target may be a single entry or an ordered fallback list. The first
+/// entry that resolves wins, which is what makes selectors robust in practice.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum TargetSpec {
+    One(Target),
+    Many(Vec<Target>),
+}
+
+impl TargetSpec {
+    fn list(&self) -> &[Target] {
+        match self {
+            TargetSpec::One(t) => std::slice::from_ref(t),
+            TargetSpec::Many(v) => v,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Target {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub automation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub control_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub y: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub roi: Option<[i32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
 }
 
@@ -169,9 +219,9 @@ impl Adaptive {
 fn load_workflow(path: &str) -> Result<Workflow, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let wf: Workflow = serde_yaml::from_str(&text).map_err(|e| format!("parse {path}: {e}"))?;
-    if wf.schema_version != 1 {
+    if wf.schema_version != 1 && wf.schema_version != 2 {
         return Err(format!(
-            "unsupported schema_version {} (expected 1)",
+            "unsupported schema_version {} (expected 1 or 2)",
             wf.schema_version
         ));
     }
@@ -193,7 +243,9 @@ fn selector(t: &Target) -> uia::Selector {
 
 fn target_threshold(step: &Step, defaults: &Defaults) -> f32 {
     step.threshold
-        .or_else(|| step.target.as_ref().and_then(|t| t.threshold))
+        .or_else(|| step.target.as_ref().and_then(|t| {
+            t.list().iter().find_map(|x| x.threshold)
+        }))
         .or_else(|| step.expect.as_ref().and_then(|e| e.threshold))
         .or(defaults.threshold)
         .unwrap_or(0.85)
@@ -204,8 +256,53 @@ fn target_threshold(step: &Step, defaults: &Defaults) -> f32 {
 fn threshold_key(step: &Step) -> String {
     step.target
         .as_ref()
+        .and_then(|t| t.list().first())
         .and_then(|t| t.name.clone())
         .unwrap_or_else(|| step.id.clone())
+}
+
+/// Expand `${name}` references from the workflow variables. Unknown names are
+/// left as-is so a typo fails loudly on the next step instead of vanishing.
+fn subst(s: &str, vars: &HashMap<String, String>) -> String {
+    if !s.contains("${") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                match vars.get(name) {
+                    Some(v) => out.push_str(v),
+                    None => {
+                        out.push_str("${");
+                        out.push_str(name);
+                        out.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn subst_target(t: &Target, vars: &HashMap<String, String>) -> Target {
+    let mut t = t.clone();
+    t.name = t.name.map(|v| subst(&v, vars));
+    t.text = t.text.map(|v| subst(&v, vars));
+    t.path = t.path.map(|v| subst(&v, vars));
+    t.window = t.window.map(|v| subst(&v, vars));
+    t.automation_id = t.automation_id.map(|v| subst(&v, vars));
+    t
 }
 
 struct Resolved {
@@ -214,6 +311,52 @@ struct Resolved {
     score: Option<f32>,
     screen: cli::Screen,
     detail: String,
+    captures: HashMap<String, String>,
+}
+
+fn captures_for(
+    x: i32,
+    y: i32,
+    score: Option<f32>,
+    extra: &[(&str, String)],
+) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("x".to_string(), x.to_string());
+    m.insert("y".to_string(), y.to_string());
+    if let Some(s) = score {
+        m.insert("score".to_string(), format!("{s:.4}"));
+    }
+    for (k, v) in extra {
+        m.insert((*k).to_string(), v.clone());
+    }
+    m
+}
+
+/// Try each entry of a fallback chain in order; the first hit wins.
+fn resolve_any(
+    cfg: &cli::Config,
+    conn: &rusqlite::Connection,
+    step: &Step,
+    spec: &TargetSpec,
+    threshold: f32,
+    report_dir: &Path,
+    interactive: bool,
+    vars: &HashMap<String, String>,
+) -> Result<Resolved, String> {
+    let mut errors = Vec::new();
+    for (i, t) in spec.list().iter().enumerate() {
+        let t = subst_target(t, vars);
+        match resolve_target(cfg, conn, step, &t, threshold, report_dir, interactive) {
+            Ok(mut r) => {
+                if i > 0 {
+                    r.detail = format!("{} (fallback #{})", r.detail, i + 1);
+                }
+                return Ok(r);
+            }
+            Err(e) => errors.push(format!("#{}: {e}", i + 1)),
+        }
+    }
+    Err(format!("no target matched: {}", errors.join(" | ")))
 }
 
 fn resolve_target(
@@ -237,6 +380,7 @@ fn resolve_target(
                 score: None,
                 screen,
                 detail: format!("coords {x},{y}"),
+                captures: captures_for(x, y, None, &[]),
             })
         }
         "element" => {
@@ -258,6 +402,12 @@ fn resolve_target(
                 score: Some(r.hit.score),
                 screen,
                 detail: format!("element {name}"),
+                captures: captures_for(
+                    r.screen_cx,
+                    r.screen_cy,
+                    Some(r.hit.score),
+                    &[("element", name.to_string())],
+                ),
             })
         }
         "template" => {
@@ -290,6 +440,7 @@ fn resolve_target(
                 score: Some(hit.score),
                 screen,
                 detail: format!("template {path}"),
+                captures: captures_for(x, y, Some(hit.score), &[]),
             })
         }
         "uia" => {
@@ -320,6 +471,16 @@ fn resolve_target(
                 score: None,
                 screen,
                 detail: format!("uia {} {:?}", node.control_type_name, node.name),
+                captures: captures_for(
+                    node.cx(),
+                    node.cy(),
+                    None,
+                    &[
+                        ("uia_name", node.name.clone()),
+                        ("uia_automation_id", node.automation_id.clone()),
+                        ("uia_control_type", node.control_type_name.to_string()),
+                    ],
+                ),
             })
         }
         "ocr" => {
@@ -337,6 +498,12 @@ fn resolve_target(
                 score: Some(hit.conf / 100.0),
                 screen,
                 detail: format!("ocr {text}"),
+                captures: captures_for(
+                    x,
+                    y,
+                    Some(hit.conf / 100.0),
+                    &[("ocr_text", hit.text.clone())],
+                ),
             })
         }
         other => Err(format!("unknown target type: {other}")),
@@ -350,13 +517,18 @@ fn check_expect(
     expect: &Target,
     threshold: f32,
     report_dir: &Path,
-) -> Result<(bool, Option<f32>, String), String> {
+) -> Result<(bool, Option<f32>, String, HashMap<String, String>), String> {
     let kind = if expect.kind.is_empty() { "none" } else { expect.kind.as_str() };
     match kind {
-        "none" => Ok((true, None, "none".into())),
+        "none" => Ok((true, None, "none".into(), HashMap::new())),
         "window" => {
             let title = expect.window.as_deref().unwrap_or("");
-            Ok((uia::window_exists(title), None, format!("window {title}")))
+            Ok((
+                uia::window_exists(title),
+                None,
+                format!("window {title}"),
+                HashMap::new(),
+            ))
         }
         "template" | "element" => {
             let screen = cli::capture()?;
@@ -364,13 +536,14 @@ fn check_expect(
                 let name = expect.name.as_deref().unwrap_or("");
                 let elements = crate::load_elements(conn);
                 let Some(e) = cli::find_element(&elements, name).cloned() else {
-                    return Ok((false, None, format!("element not found: {name}")));
+                    return Ok((false, None, format!("element not found: {name}"), HashMap::new()));
                 };
                 let r = cli::match_element(cfg, &screen, &e, expect.state.as_deref(), threshold)?;
                 return Ok((
                     r.found,
                     Some(r.hit.score),
                     format!("element {name} score {:.4}", r.hit.score),
+                    captures_for(r.screen_cx, r.screen_cy, Some(r.hit.score), &[("element", name.to_string())]),
                 ));
             }
             let path = expect.path.as_deref().unwrap_or("");
@@ -386,7 +559,12 @@ fn check_expect(
             });
             let hit = matchutil::find_template_smart(&screen.img, &template, roi, threshold);
             let (found, score) = hit.map(|h| (h.score >= threshold, h.score)).unwrap_or((false, 0.0));
-            Ok((found, Some(score), format!("template {path} score {score:.4}")))
+            Ok((
+                found,
+                Some(score),
+                format!("template {path} score {score:.4}"),
+                HashMap::new(),
+            ))
         }
         "ocr" => {
             let text = expect.text.as_deref().unwrap_or("");
@@ -397,12 +575,18 @@ fn check_expect(
             screen.img.save(&img_path).map_err(|e| e.to_string())?;
             let hit = ocr::find_text(&img_path, text, lang)?;
             match hit {
-                Some(h) => Ok((
-                    true,
-                    Some(h.conf / 100.0),
-                    format!("ocr {text} conf {:.1}", h.conf),
-                )),
-                None => Ok((false, None, format!("ocr not found: {text}"))),
+                Some(h) => {
+                    let (x, y) = screen.to_screen(h.x + h.w / 2, h.y + h.h / 2);
+                    let mut caps = captures_for(x, y, Some(h.conf / 100.0), &[("ocr_text", h.text.clone())]);
+                    caps.insert("text".to_string(), h.text.clone());
+                    Ok((
+                        true,
+                        Some(h.conf / 100.0),
+                        format!("ocr {text} conf {:.1}", h.conf),
+                        caps,
+                    ))
+                }
+                None => Ok((false, None, format!("ocr not found: {text}"), HashMap::new())),
             }
         }
         other => Err(format!("unknown expect type: {other}")),
@@ -447,6 +631,7 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
     let started_at = chrono::Local::now().to_rfc3339();
     let mut reports = Vec::new();
     let mut all_ok = true;
+    let mut vars = wf.vars.clone();
 
     for (idx, step) in wf.steps.iter().enumerate() {
         let t0 = Instant::now();
@@ -460,15 +645,23 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
         let mut screenshot = None;
         let mut detail = None;
         let mut adaptive_note = None;
+        let mut captures: HashMap<String, String> = HashMap::new();
 
         for attempt in 0..=retries {
             attempts = attempt + 1;
-            let result = (|| -> Result<(Option<f32>, Option<String>, cli::Screen), String> {
+            let result = (|| -> Result<
+                (Option<f32>, Option<String>, cli::Screen, HashMap<String, String>),
+                String,
+            > {
                 let mut resolved: Option<Resolved> = None;
+                captures.clear();
                 if let Some(target) = &step.target {
-                    let r = resolve_target(&cfg, &conn, step, target, threshold, &dir, !dry_run)?;
+                    let r = resolve_any(
+                        &cfg, &conn, step, target, threshold, &dir, !dry_run, &vars,
+                    )?;
                     detail = Some(r.detail.clone());
                     score = r.score;
+                    captures.extend(r.captures.clone());
                     resolved = Some(r);
                 }
                 let action = step.action.to_ascii_lowercase();
@@ -490,9 +683,43 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
                                 std::thread::sleep(std::time::Duration::from_millis(120));
                             }
                             if action == "type" {
-                                input::send_text(step.text.as_deref().unwrap_or(""))?;
+                                let text = subst(step.text.as_deref().unwrap_or(""), &vars);
+                                input::send_text(&text)?;
                             } else {
-                                input::send_key(step.key.as_deref().unwrap_or("enter"))?;
+                                let key = subst(step.key.as_deref().unwrap_or("enter"), &vars);
+                                input::send_key(&key)?;
+                            }
+                        }
+                        "wait_for" => {
+                            // Poll the expectation instead of sleeping a fixed
+                            // number of retries: fast UIs proceed immediately.
+                            let expect = step
+                                .expect
+                                .as_ref()
+                                .ok_or_else(|| "wait_for needs expect".to_string())?;
+                            let expect = subst_target(expect, &vars);
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_millis(
+                                    step.timeout_ms.or(step.ms).unwrap_or(5000),
+                                );
+                            let poll = std::time::Duration::from_millis(
+                                step.poll_ms.unwrap_or(250).max(20),
+                            );
+                            loop {
+                                let (ok, exp_score, exp_detail, caps) =
+                                    check_expect(&cfg, &conn, step, &expect, threshold, &dir)?;
+                                detail = Some(exp_detail.clone());
+                                if ok {
+                                    if score.is_none() {
+                                        score = exp_score;
+                                    }
+                                    captures.extend(caps);
+                                    break;
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    return Err(format!("wait_for timed out: {exp_detail}"));
+                                }
+                                std::thread::sleep(poll);
                             }
                         }
                         "wait" => {
@@ -504,11 +731,12 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
                         other => return Err(format!("unknown action: {other}")),
                     }
                 }
-                if !dry_run {
+                if !dry_run && action != "wait_for" {
                     if let Some(expect) = &step.expect {
                         std::thread::sleep(std::time::Duration::from_millis(120));
-                        let (ok, exp_score, exp_detail) =
-                            check_expect(&cfg, &conn, step, expect, threshold, &dir)?;
+                        let expect = subst_target(expect, &vars);
+                        let (ok, exp_score, exp_detail, caps) =
+                            check_expect(&cfg, &conn, step, &expect, threshold, &dir)?;
                         if score.is_none() {
                             score = exp_score;
                         }
@@ -519,6 +747,7 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
                         if !ok {
                             return Err("expectation failed".into());
                         }
+                        captures.extend(caps);
                     }
                 }
                 let screen = cli::capture().unwrap_or_else(|_| {
@@ -533,11 +762,12 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
                             origin: (0, 0),
                         })
                 });
-                Ok((score, detail.clone(), screen))
+                Ok((score, detail.clone(), screen, captures.clone()))
             })();
 
             match result {
-                Ok((_s, _d, screen)) => {
+                Ok((_s, _d, screen, caps)) => {
+                    captures = caps;
                     screenshot = save_step_screenshot(&screen, &dir, idx, &step.id);
                     last_err = None;
                     adaptive_note = adaptive.record(&key, base, true, score);
@@ -552,6 +782,19 @@ pub fn run(path: &str, json: bool, dry_run: bool, report_dir: Option<&str>) -> i
             }
         }
 
+        let ok = last_err.is_none();
+        if ok {
+            for (var, src) in &step.save {
+                match captures.get(src) {
+                    Some(v) => {
+                        vars.insert(var.clone(), v.clone());
+                    }
+                    None => {
+                        last_err = Some(format!("save: unknown source '{src}' for var '{var}'"));
+                    }
+                }
+            }
+        }
         let ok = last_err.is_none();
         if !ok {
             adaptive_note = adaptive.record(&key, base, false, score);
@@ -661,7 +904,10 @@ steps:
 "#;
         let wf: Workflow = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(wf.steps.len(), 1);
-        assert_eq!(wf.steps[0].target.as_ref().unwrap().name.as_deref(), Some("scene/btn"));
+        assert_eq!(
+            wf.steps[0].target.as_ref().unwrap().list()[0].name.as_deref(),
+            Some("scene/btn")
+        );
         let json = r#"{"schema_version":1,"steps":[{"id":"w","action":"wait","ms":10}]}"#;
         let wf2: Workflow = serde_yaml::from_str(json).unwrap();
         assert_eq!(wf2.steps[0].action, "wait");

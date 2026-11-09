@@ -63,7 +63,7 @@
       "col": 0,
       "type": "frontend",
       "label": "mrctl 子命令",
-      "sublabel": "list / find / click / run",
+      "sublabel": "list / find / click / serve",
       "width": 150
     },
     {
@@ -71,8 +71,8 @@
       "lane": "cli",
       "col": 1,
       "type": "frontend",
-      "label": "工作流文件",
-      "sublabel": "JSON / YAML 同 schema",
+      "label": "工作流文件 v2",
+      "sublabel": "步骤 / 回退链 / 变量",
       "width": 150
     },
     {
@@ -100,7 +100,7 @@
       "col": 4,
       "type": "messagebus",
       "label": "执行动作",
-      "sublabel": "点击 / 输入 / 按键 / 等待",
+      "sublabel": "点击 / 输入 / wait_for",
       "width": 156
     },
     {

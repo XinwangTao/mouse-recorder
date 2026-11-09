@@ -53,7 +53,9 @@ mouse-recorder.exe --cli <command> [options]
 | `click --element NAME[:STATE]` / `--template PATH` / `--uia` / `--coords x,y` | Click a target; `--verify` re-checks afterwards |
 | `uia --window TITLE [--name X] [--automation-id X] [--class X] [--control-type X]` | Dump/filter Windows UIA controls with screen rects |
 | `ocr --text TEXT [--image PATH] [--lang eng]` | OCR text lookup (local Tesseract) |
-| `run workflow.json\|yaml [--json]` | Execute a click workflow |
+| `run workflow.json\|yaml [--json] [--dry-run]` | Execute a click workflow |
+| `record-workflow --out FILE [--no-template]` | Record clicks/typing into a workflow (Esc stops) |
+| `serve` | Long-lived JSON request/response server over stdin/stdout |
 
 All geometry uses the same image-relative + `origin` model as the GUI; the CLI
 converts to virtual-screen coordinates before moving the mouse. `--rect`,
@@ -64,23 +66,43 @@ converts to virtual-screen coordinates before moving the mouse. `--rect`,
 > the exe there; running `target/release/mouse-recorder.exe` uses
 > `target/release/data`.
 
-### Workflow format (JSON or YAML, schema_version 1)
+### Workflow format (JSON or YAML, schema_version 1 or 2)
+
+Schema v2 adds target fallback lists, `wait_for`, variables and captured
+values; v1 files keep working unchanged.
 
 ```yaml
-schema_version: 1
+schema_version: 2
 name: login
+vars:
+  user: "alice"
 defaults:
   threshold: 0.85
   retry: 2
 steps:
-  - id: open
-    action: click
-    target:
-      type: element          # element | template | uia | ocr | coords
-      name: scene/login_btn
+  - id: wait-dialog
+    action: wait_for
+    timeout_ms: 8000
+    poll_ms: 200
     expect:
-      type: window           # none | window | element | template | ocr
+      type: window
       window: "登录"
+  - id: fill-user
+    action: type
+    text: "${user}"
+    target:                    # a list = try in order, first hit wins
+      - type: uia
+        window: "登录"
+        automation_id: "txtUser"
+      - type: template
+        path: "templates/user_field.png"
+  - id: read-greeting
+    action: assert
+    expect:
+      type: ocr
+      text: "欢迎"
+    save:
+      greeting: ocr_text       # store for later steps as ${greeting}
   - id: submit
     action: click
     target:
@@ -92,10 +114,41 @@ steps:
       type: none
 ```
 
-Each step writes a screenshot, score, elapsed time and error to
+Steps write a screenshot, score, elapsed time and error to
 `runs/<timestamp>/report.json`; exit code 4 means an assertion failed. Adaptive
 thresholds (0.50–0.98) are stored in `runs/thresholds.json` and adjust only
 after consecutive evidence.
+
+Saveable sources: `x`, `y`, `score`, `text`, `ocr_text`, `uia_name`,
+`uia_automation_id`, `uia_control_type`, `element`. `${name}` expands in
+`text`, `key` and target fields (`name`, `text`, `path`, `window`,
+`automation_id`).
+
+### Recording a workflow
+
+```
+mrctl.exe --cli record-workflow --out wf.yaml [--no-template] [--max-steps N]
+```
+
+Click and type as usual; **Esc** stops and writes the file. Each click becomes
+a `click` step with a fallback chain: the UIA control under the cursor (by
+automation id, else name, else class) and a template crop saved under
+`templates/`. Controls covering more than half the screen are skipped as
+anchors. Printable keys are buffered into a `type` step; Enter/Tab become `key`
+steps; Backspace edits the buffer. IME/composed text cannot be reconstructed
+from key codes — add those as explicit `type` steps.
+
+### Serve mode
+
+```
+mrctl.exe --cli serve
+{"id":1,"args":["find","--element","scene/btn","--json"]}
+{"mrctl":1,"id":1,"code":0,"out":"[...]","err":""}
+```
+
+One JSON request per line on stdin, one JSON response per line on stdout with
+the command's captured stdout/stderr and exit code. The process keeps the DB
+open, so repeated calls skip process start and DB open. `quit` or EOF exits.
 
 OCR uses the locally installed Tesseract; available languages depend on its
 `tessdata` (this machine has `eng`). `ocr --window TITLE` crops that window and

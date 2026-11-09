@@ -1,0 +1,52 @@
+schema_version: 2
+name: v2-features
+vars:
+  greeting: "HELLO"
+defaults:
+  retry: 0
+steps:
+  # wait_for polls instead of sleeping a guessed number of retries
+  - id: wait-for-window
+    action: wait_for
+    timeout_ms: 8000
+    poll_ms: 200
+    expect:
+      type: window
+      window: "MR-E2E-Target"
+
+  # a list target = ordered fallback chain, first hit wins
+  - id: focus-input
+    action: click
+    target:
+      - type: uia
+        window: MR-E2E-Target
+        automation_id: primary-id-that-may-be-missing
+      - type: uia
+        window: MR-E2E-Target
+        automation_id: mrInput
+      - type: template
+        path: templates/input.png
+
+  # ${var} expands in text/key and in target fields
+  - id: type-greeting
+    action: type
+    text: "${greeting} OCR 2026"
+    target:
+      type: uia
+      window: MR-E2E-Target
+      automation_id: mrInput
+
+  # save stores a resolved value for later steps
+  - id: read-back
+    action: assert
+    expect:
+      type: ocr
+      text: HELLO
+    save:
+      seen: ocr_text
+
+  - id: use-saved
+    action: assert
+    expect:
+      type: ocr
+      text: "${seen}"

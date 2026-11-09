@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 pub mod input;
 pub mod ocr;
+pub mod recorder;
+pub mod serve;
 pub mod uia;
 pub mod workflow;
 
@@ -61,6 +63,12 @@ pub fn run(args: Vec<String>) -> i32 {
         print_help();
         return if args.is_empty() { 2 } else { 0 };
     }
+    exec(&args)
+}
+
+/// Dispatch one command. Split out of [`run`] so `serve` can reuse it without
+/// the process-start cost.
+pub(crate) fn exec(args: &[String]) -> i32 {
     let cmd = args[0].as_str();
     let rest = &args[1..];
     let result = match cmd {
@@ -94,6 +102,8 @@ pub fn run(args: Vec<String>) -> i32 {
             println!("mrctl {VERSION}");
             0
         }
+        "record-workflow" => recorder::run(rest),
+        "serve" => serve::run(),
         other => usage(&format!("未知子命令: {other}")),
     };
     if result != 0 && cmd == "help" {
@@ -127,6 +137,9 @@ Commands:
   uia    --window TITLE [--json] [--max N] [--depth N]
          [--name X] [--automation-id X] [--class X] [--control-type X]
   run <workflow.json|yaml> [--json] [--dry-run] [--report-dir DIR]
+  record-workflow [--out FILE] [--no-template] [--max-steps N]
+                                        Record clicks/typing into a workflow
+  serve                                 Long-lived JSON request/response server
   version | help
 
 Exit codes: 0 ok, 2 usage, 3 target not found / low score, 4 assertion failed
@@ -134,7 +147,7 @@ Exit codes: 0 ok, 2 usage, 3 target not found / low score, 4 assertion failed
     );
 }
 
-fn usage(msg: &str) -> i32 {
+pub(crate) fn usage(msg: &str) -> i32 {
     eprintln!("error: {msg}");
     eprintln!("run `mouse-recorder.exe --cli help` for usage");
     2
@@ -158,7 +171,7 @@ pub(crate) struct Opts {
 }
 
 const BOOL_FLAGS: &[&str] = &[
-    "json", "double", "right", "verify", "overwrite", "dry-run", "uia", "force",
+    "json", "double", "right", "verify", "overwrite", "dry-run", "uia", "force", "no-template",
 ];
 
 impl Opts {

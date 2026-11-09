@@ -2,6 +2,42 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.0] — 2026-11-09
+
+### Added
+- **`record-workflow`**: record real clicks and typing into a workflow file.
+  Each click becomes a step whose target is a fallback chain — the UIA control
+  under the cursor, then a template crop of the click area. Esc stops and
+  writes. Controls covering more than half the screen (shell panes, webview
+  hosts) are skipped as anchors.
+- **Workflow schema v2** (v1 files still work):
+  - `target` may be a **list**: entries are tried in order, first hit wins.
+  - `action: wait_for` polls `expect` every `poll_ms` until it passes or
+    `timeout_ms` elapses, instead of guessing a retry count.
+  - `vars` plus `${name}` expansion in `text`, `key` and target fields.
+  - `save: {var: source}` stores `x y score text ocr_text uia_name
+    uia_automation_id uia_control_type element` for later steps.
+- **`serve`**: long-lived process, one JSON request per line on stdin, one JSON
+  response per line with the command's captured stdout/stderr and exit code.
+  Removes process-start and DB-open cost for agents making many calls.
+
+### Changed
+- `raise_window` retries up to 3 times when another process keeps stealing the
+  foreground.
+- Recorded/serialized workflows omit null fields.
+
+### Verified
+- `wait_for` matched a live window in 191ms; a missing window timed out at
+  1.2s with exit 4.
+- Fallback chain reported `(fallback #2)` in the report; an exhausted chain
+  returned every entry's error.
+- Variables round-tripped: typed `${greeting}`, read back via OCR, saved as
+  `${seen}` and asserted again.
+- `record-workflow` captured a click (UIA + template chain), `abc` and Enter,
+  then produced a workflow that dry-runs clean.
+- `serve` answered two requests with captured output and exit codes.
+- 37 unit tests pass.
+
 ## [0.7.3] — 2026-11-09
 
 ### Fixed
